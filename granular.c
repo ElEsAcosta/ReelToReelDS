@@ -63,7 +63,7 @@
 #define OUT_RATE    32768   // lo que pedimos; el hardware corre a ~32728.5 Hz
 #define OUT_LEN     4096    // anillo de salida: 4096 muestras = 1 vuelta del timer (DIV_64)
 #define CHUNK       256     // muestras que renderizamos por tanda
-#define LEAD        1792    // cuanto renderizamos por delante del playhead (~55 ms)
+#define LEAD        2560    // cuanto renderizamos por delante del playhead (~78 ms): colchon contra tirones
 #define RESYNC      (LEAD + 3 * CHUNK)   // si el adelanto parece mayor, el playhead nos paso: resincronizar
 #define MAX_GRAINS  12
 #define WIN_LEN     256
@@ -112,7 +112,9 @@ static Deck decks[2];
 static Deck *dk = &decks[0];         // deck "activo": el que controlan teclas, botones y menu
 static int actDeck = 0;
 static s32 xfade = 0;                // crossfader 0 = solo A ... 256 = solo B
-static s32 xfGainA = 256, xfGainB = 0;   // ganancias de potencia constante (Q8)
+static s32 xfGainA = 256, xfGainB = 0;
+static s32 xgS[2] = { 256 << 8, 0 };    // ganancias suavizadas (Q16) para que mover el crossfader no haga clicks
+static s32 grainCap = MAX_GRAINS;       // tope de granos por deck; baja solo si la CPU no da abasto   // ganancias de potencia constante (Q8)
 
 static bool touching = false, freezeKey = false;
 static bool loopEdit = false;        // modo editar loop: el stylus delimita el loop en la onda
@@ -589,6 +591,9 @@ static inline s32 lp2(s32 *st, s32 x) {
 }
 
 static void spawn(void) {
+    int act = 0;
+    for (int g = 0; g < MAX_GRAINS; g++) act += dk->grains[g].on;
+    if (act >= grainCap) return;                 // CPU justa: no abrir mas granos
     for (int g = 0; g < MAX_GRAINS; g++) {
         if (dk->grains[g].on) continue;
         s32 sp = (s32)(sprayMs * dk->srcRate / 1000);
@@ -670,7 +675,7 @@ static void deckRender(Deck *d, s32 xg, s32 *oDL, s32 *oDR, s32 *oSL, s32 *oSR, 
     s32 dL = 0, dR = 0, sL = 0, sR = 0;
     if (dk->mixQ < MIX_FULL) {
         if (dk->playing && !(touching && d == &decks[actDeck]) && !(freezeKey && d == &decks[actDeck])) advancePos();
-        if (xg < 6) {
+        if (xg < 2) {
             killGrains();                               // deck apagado por el crossfader: solo avanza la cinta
         } else {
             if (dk->playing || (touching && d == &decks[actDeck])) {
@@ -739,8 +744,10 @@ static void render(s16 *dstL, s16 *dstR, int n) {
         aCur += (aTgt - aCur) >> 6;
 
         s32 dL[2], dR[2], sL[2], sR[2], tr[2];
-        deckRender(&decks[0], xfGainA, &dL[0], &dR[0], &sL[0], &sR[0], &tr[0]);
-        deckRender(&decks[1], xfGainB, &dL[1], &dR[1], &sL[1], &sR[1], &tr[1]);
+        xgS[0] += ((xfGainA << 8) - xgS[0]) >> 8;
+        xgS[1] += ((xfGainB << 8) - xgS[1]) >> 8;
+        deckRender(&decks[0], xgS[0] >> 8, &dL[0], &dR[0], &sL[0], &sR[0], &tr[0]);
+        deckRender(&decks[1], xgS[1] >> 8, &dL[1], &dR[1], &sL[1], &sR[1], &tr[1]);
 
         // reverb estereo sobre las dos nubes
         s32 wl, wr;
@@ -1431,13 +1438,14 @@ static void drawMain(u32 lead) {
     if (topFull) clearScreen(fbTop, C_BG);
     char sig[128], v[24];
 
-    snprintf(sig, sizeof sig, "%d|%d|%d", actDeck, (int)sdOK, (int)xfade);
+    snprintf(sig, sizeof sig, "%d|%d|%d|%d", actDeck, (int)sdOK, (int)xfade, (int)grainCap);
     if (sigChanged(0, sig)) {
         rect(fbTop, 0, 0, VW, 14, C_PANEL);
         rect(fbTop, 0, 0, 4, 14, C_ORG);
         text(fbTop, 10, 2, "EFEES", C_WHITE, 1);
         text(fbTop, 46, 2, "reel to reel", C_ORG, 1);
         if (!sdOK) text(fbTop, 112, 2, "sin SD", C_GRAY, 1);
+        else if (grainCap < MAX_GRAINS) { char gs[12]; snprintf(gs, sizeof gs, "g%d", (int)grainCap); text(fbTop, 118, 2, gs, C_GRAY, 1); }
         char x[16];
         snprintf(x, sizeof x, "A %ld%% B", (long)(xfade * 100 / 256));
         text(fbTop, VW - 6 - textW(x, 1), 2, x, C_YEL, 1);
@@ -1448,6 +1456,7 @@ static void drawMain(u32 lead) {
         snprintf(sig, sizeof sig, "%d|%d|%.100s", di == actDeck, di, decks[di].curName);
         if (sigChanged(11 + di, sig)) st = true;
         drawDeckPanel(di, heardPosD(&decks[di], lead), st);
+        audioTick();
     }
     // nivel de cada deck segun el crossfader
     {
@@ -1704,7 +1713,7 @@ static void updateView(u32 lead) {
         if (dk->playing != lastPlaying || loopEdit != lastLoopOn || actDeck != lastAct) drawButtons();
     }
     lastV[0] = v[0]; lastV[1] = v[1];
-    drawGrains();
+    { static u32 gc = 0; if ((++gc & 3) == 0 || fullRedraw) drawGrains(); }   // marcas de granos a ~15 fps
 }
 
 // donde esta la cabeza segun lo que SE ESCUCHA (el audio se renderiza ~47 ms por delante)
@@ -1741,12 +1750,21 @@ static void ringReset(u32 *wr, u32 t) {
 }
 
 // renderiza por delante del playhead; si el playhead nos alcanzo (hubo un tiron) resincroniza
+static u32 okChunks = 0;
 static u32 pump(u32 wr, u32 t) {
     leadT -= (s32)((t - tPrev) & 0xFFFF);
     tPrev = t;
-    if (leadT < 0) ringReset(&wr, t);
+    if (leadT < 0) {                               // nos alcanzo el playhead: hubo sobrecarga
+        ringReset(&wr, t);
+        if (grainCap > 4) grainCap -= 2;
+        okChunks = 0;
+    }
     while (leadT < leadGoal) {
+        u16 c0 = TIMER_DATA(0);
         render(&outL[wr], &outR[wr], CHUNK);
+        u16 used = (u16)(TIMER_DATA(0) - c0);       // ticks gastados (presupuesto: 16 por muestra = 4096 por tanda)
+        if (used > 3000) { if (grainCap > 4) grainCap--; okChunks = 0; }
+        else if (used < 2000 && ++okChunks > 600) { if (grainCap < MAX_GRAINS) grainCap++; okChunks = 0; }
         DC_FlushRange(&outL[wr], CHUNK * 2);
         DC_FlushRange(&outR[wr], CHUNK * 2);
         wr = (wr + CHUNK) & (OUT_LEN - 1);
@@ -1920,9 +1938,10 @@ int main(void) {
         s32 lt = leadT - (s32)((TIMER_DATA(0) - tPrev) & 0xFFFF);
         u32 lead = lt > 0 ? (u32)lt / 16 : 0;
         updateView(lead);
+        audioTick();
         if (!browsing) {
-            for (int di = 0; di < 2; di++) decks[di].reel += decks[di].playing ? 9000 : 0;   // carretes girando
-            if (uiDirty || (++frame & 1) == 0) { drawMain(lead); uiDirty = false; }
+            for (int di = 0; di < 2; di++) decks[di].reel += decks[di].playing ? 54000 : 0;   // carretes girando
+            if (uiDirty || (++frame % 6) == 0) { drawMain(lead); uiDirty = false; }
         }
 
         // audio: renderiza por delante del playhead
