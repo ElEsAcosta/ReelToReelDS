@@ -1,0 +1,1826 @@
+// granular.c - sampler granular para tracks enteros en Nintendo DS/DSi (libnds + libfat, ARM9)
+//
+// Idea: la "cabeza de lectura" avanza sola por el track (play), y alrededor de ella se
+// disparan granos. Velocidad y pitch son independientes: puedes estirar, congelar o
+// invertir el track sin cambiar el tono (o al reves). Con DROP sueltas el track entero,
+// limpio, sin ninguna modificacion, y puedes volver a la nube desde donde va la cancion.
+//
+// PANTALLA DE ABAJO (tactil): forma de onda en tiempo real
+//   toca / arrastra la onda : scrub (suena aunque estes en pausa; si estabas en DROP, lo suelta)
+//   botones: [play/pausa] [loop] [inicio] [SD = cargar WAV] [DROP]
+//   linea naranja = cabeza de lectura (blanca en DROP), onda amarilla = ya reproducido, gris = por tocar,
+//   fondo calido = region de loop, banda clara = spray, onda blanca = ancho de un grano,
+//   marcas amarillas arriba = granos sonando
+// Paleta: grises, amarillo claro, blanco y naranja. Las dos pantallas son bitmaps con fuente propia.
+//
+// BOTONES
+//   START       play / pausa
+//   A           DROP: fundido hacia el track limpio; otra vez A vuelve a la nube (retoma donde va la cancion)
+//   B (mantener) freeze: congela la cabeza, sigue sonando la nube de granos
+//   SELECT      loop on/off
+//   X / Y       fijar inicio / fin del loop en la posicion actual (Y activa el loop)
+//   L / R       saltar -5 s / +5 s (en DROP salta el track limpio)
+//   Arr / Abajo elegir parametro, Izq / Der cambiar su valor
+//
+// PARAMETROS (menu de arriba, con scroll)
+//   VELOCID -200..+200 %   (0 = congelado, negativo = hacia atras, sin cambiar el pitch)
+//   PITCH -24..+24 st   TAMANO 10..2000 ms   DENSID 1..100 granos/s
+//   SPRAY 0..500 ms (aleatoriedad de posicion)   DERIVA 0..100 (la posicion divaga lentamente)
+//   ARMONIA 0..100 % de granos transpuestos a -12/-5/+7/+12
+//   JITTER 0..100 cents   REVERSA 0..100 % de granos al reves
+//   REVERB 0..100 % mezcla   COLA 0..100 (largo de la cola, hasta ~10 s)
+//   ESTEREO 0..100  cuanto se abre la nube en el panorama (cada grano cae en un lugar distinto)
+//   SHIMMER 0..100  granos en octavas (+12/+24/+19/-12) que suben y bajan solos (~17 s) y suenan sobre todo
+//                   dentro de la reverb, como un pad brillante
+//   FILTRO  pasa-bajos de toda la salida (40 Hz .. 9 kHz; 100 = abierto)   BARRIDO 0..100 profundidad de un
+//                   barrido lento y automatico del filtro (~12 s por ciclo)
+//   DELAY 0..100 mezcla de eco estereo (ping-pong: los ecos rebotan de un oido al otro)
+//   TIEMPO 50..1000 ms (cambiarlo desliza el tono como una cinta)   REPITE 0..95 cuanto se repite
+//   VOLUMEN (el volumen automatico sube solo los tracks flojos; 1.0x = nivel base)   FUNDIDO 0.05..16 s (duracion del DROP)
+//   DROP DE inicio / la cabeza (desde donde arranca el track limpio)
+//   CARGAR  abre la SD (tambien: boton de carpeta)
+//
+// El volumen de la nube se compensa solo segun cuantos granos se solapan (densidad x tamano),
+// asi un pad grueso no suena mas fuerte que uno disperso.
+//
+// WAV soportados: PCM 8/16/24 bit, mono o estereo, cualquier frecuencia. Se mezcla a mono,
+// se normaliza y se guarda en 8 bit; si no cabe en RAM (la DS tiene 4 MB) se reduce la
+// frecuencia de muestreo. La primera carga de cada WAV crea "<archivo>.wav.gr8" en la SD
+// (version liviana); las siguientes cargas son casi instantaneas.
+// MP3 y otros formatos: convertirlos antes en el PC con to_ds.py.
+
+#include <nds.h>
+#include <fat.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <math.h>
+
+#define OUT_RATE    32768   // lo que pedimos; el hardware corre a ~32728.5 Hz
+#define OUT_LEN     4096    // anillo de salida: 4096 muestras = 1 vuelta del timer (DIV_64)
+#define CHUNK       256     // muestras que renderizamos por tanda
+#define LEAD        1792    // cuanto renderizamos por delante del playhead (~55 ms)
+#define RESYNC      (LEAD + 3 * CHUNK)   // si el adelanto parece mayor, el playhead nos paso: resincronizar
+#define MAX_GRAINS  12
+#define WIN_LEN     256
+
+#define DEMO_RATE   16000   // sample de demostracion (suena hasta que cargues un WAV)
+#define DEMO_LEN    (DEMO_RATE * 2)
+
+#define MAX_SECS    60      // limite: 1 minuto por deck
+#define BUDGET      1200000 // bytes de RAM para el sample (8 bit): 2 min -> ~20 kHz, deja margen de memoria
+
+#define MIX_FULL    (1 << 24)   // mezcla del DROP en Q24: 0 = solo nube, MIX_FULL = solo track limpio
+
+#define VW      256
+#define VH      192
+
+// posicion del grano = indice entero (u32) + fraccion de 16 bit; el indice necesita mas de
+// 16 bit porque un track de 2 min tiene millones de muestras
+typedef struct { u32 ipos; s32 fpos; s32 inc; u32 wpos, winc; s32 pl, pr, amp; bool on, shim; } Grain;
+
+// Un deck = un sample con su propio transporte, nube de granos y voz limpia (DROP).
+typedef struct {
+    s8 *src, *heapBuf;
+    u32 srcLen, srcRate;
+    char curName[128];
+    bool lostSample;
+    s32 posI, posF;                  // cabeza de lectura: indice + fraccion (16 bit)
+    bool playing, loopOn, dropOn;
+    s32 loopStart, loopEnd;
+    s32 mixQ;                        // 0 = solo nube ... MIX_FULL = solo track limpio
+    s32 trackI, trackF, trackGate;   // voz limpia
+    s32 speedPct, semis, driftW, untilSpawn;
+    s32 autoQ, gainC, gainT;
+    u32 inc16, cleanInc;
+    s32 scanInc;
+    Grain grains[MAX_GRAINS];
+    u8 pkA[VH], pkB[VH];             // onda vertical: por fila, borde izquierdo / derecho
+    s32 reel;                        // angulo de los carretes (Q8, vueltas)
+} Deck;
+
+static s16 outL[OUT_LEN] __attribute__((aligned(32)));     // anillos de audio: izquierdo y derecho
+static s16 outR[OUT_LEN] __attribute__((aligned(32)));
+static s8  demoBuf[DEMO_LEN];        // sample de demostracion
+static s16 win[WIN_LEN + 1];         // +1 para interpolar la ventana
+
+static Deck decks[2];
+static Deck *dk = &decks[0];         // deck "activo": el que controlan teclas, botones y menu
+static int actDeck = 0;
+static s32 xfade = 0;                // crossfader 0 = solo A ... 256 = solo B
+static s32 xfGainA = 256, xfGainB = 0;   // ganancias de potencia constante (Q8)
+
+static bool touching = false, freezeKey = false;
+static bool loopEdit = false;        // modo editar loop: el stylus delimita el loop en la onda
+static s32  loopAnchor = 0;
+static s32  fadeIdx = 4;
+static const float fadeSec[8] = { 0.05f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f };
+static const char *const fadeTxt[8] = { "0.05 s", "0.25 s", "0.5 s", "1 s", "2 s", "4 s", "8 s", "16 s" };
+
+// parametros compartidos
+static s32 sizeMs = 120, density = 24, sprayMs = 30;
+static s32 driftPct = 0, harmPct = 0, jitterC = 0, revPct = 0;
+static s32 revMixPct = 20, decayPct = 60;
+static s32 panPct = 60, shimPct = 0, filtPct = 100, sweepPct = 0;
+static s32 delayPct = 0, delayMs = 375, delayFbPct = 45;
+static s32 gain = 40;                // volumen de la nube, Q4; el track limpio usa gain*2/5 (40 = 1.0x)
+static s32 normQ = 256;              // compensacion por solapamiento de granos (Q8)
+static s32 fadeStep = 1000;          // avance de mixQ por muestra
+static s32 harmRatio[4];             // razones Q16 de -12, -5, +7, +12 semitonos
+
+static u32 rng = 2463534242u;
+static bool sdOK = false;
+static bool browsing = false, touchDrag = false, xfDrag = false;     // navegador de la SD abierto / arrastre en la onda
+
+static bool fullRedraw = true;
+
+static void computePeaks(void);
+static void audioTick(void);       // mantiene sonando el otro deck mientras se carga       // definida mas abajo (vista)
+
+static u32 rnd(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
+static s32 clampi(s32 v, s32 lo, s32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static s32 clamp16(s32 v) { return v > 32767 ? 32767 : (v < -32768 ? -32768 : v); }
+
+static u16 rd16(const u8 *p) { return (u16)(p[0] | (p[1] << 8)); }
+static u32 rd32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+
+// ---------------------------------------------------------------- graficos
+// Las dos pantallas son bitmaps de 16 bit de 256x192. El texto usa una fuente propia de 6x10.
+
+static u16 *fb;                       // pantalla de abajo (tactil): onda y botones
+static u16 *fbTop;                    // pantalla de arriba: parametros / navegador
+
+#define RGB8(r, g, b) ARGB16(1, (r) >> 3, (g) >> 3, (b) >> 3)
+
+// paleta: grises, amarillo claro, blanco y naranja
+#define C_DARK     RGB8( 24,  24,  27)
+#define C_BG       RGB8( 32,  32,  36)
+#define C_PANEL    RGB8( 46,  46,  51)
+#define C_PANEL2   RGB8( 62,  62,  69)
+#define C_LINE     RGB8( 84,  84,  92)
+#define C_GRAY     RGB8(146, 146, 154)
+#define C_LGRAY    RGB8(204, 204, 210)
+#define C_WHITE    RGB8(255, 255, 255)
+#define C_YEL      RGB8(255, 196, 220)      // rosa claro
+#define C_YELD     RGB8(186, 124, 150)
+#define C_ORG      RGB8(255,  74, 156)      // rosa fuerte
+#define C_ORGD     RGB8(176,  44, 104)
+
+#define FONT_W 6
+#define FONT_H 10
+static const u8 font6[95][FONT_H] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},  //  
+    {0x00,0x04,0x04,0x04,0x04,0x04,0x00,0x04,0x00,0x00},  // !
+    {0x00,0x0A,0x0A,0x0A,0x00,0x00,0x00,0x00,0x00,0x00},  // "
+    {0x00,0x0A,0x0A,0x1F,0x14,0x3E,0x14,0x14,0x00,0x00},  // #
+    {0x00,0x04,0x0F,0x14,0x1C,0x07,0x05,0x1E,0x04,0x00},  // $
+    {0x00,0x38,0x28,0x3A,0x0C,0x17,0x05,0x07,0x00,0x00},  // %
+    {0x00,0x0E,0x08,0x0C,0x15,0x13,0x12,0x0D,0x00,0x00},  // &
+    {0x00,0x04,0x04,0x04,0x00,0x00,0x00,0x00,0x00,0x00},  // '
+    {0x04,0x08,0x08,0x08,0x08,0x08,0x08,0x08,0x04,0x00},  // (
+    {0x08,0x08,0x04,0x04,0x04,0x04,0x04,0x08,0x08,0x00},  // )
+    {0x00,0x15,0x0E,0x0E,0x15,0x00,0x00,0x00,0x00,0x00},  // *
+    {0x00,0x00,0x04,0x04,0x1F,0x04,0x04,0x00,0x00,0x00},  // +
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x08,0x08},  // ,
+    {0x00,0x00,0x00,0x00,0x00,0x0E,0x00,0x00,0x00,0x00},  // -
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x00,0x00},  // .
+    {0x00,0x01,0x02,0x02,0x04,0x04,0x08,0x08,0x10,0x00},  // /
+    {0x00,0x0E,0x11,0x11,0x15,0x11,0x11,0x0E,0x00,0x00},  // 0
+    {0x00,0x1C,0x04,0x04,0x04,0x04,0x04,0x1F,0x00,0x00},  // 1
+    {0x00,0x0E,0x11,0x01,0x03,0x06,0x08,0x1F,0x00,0x00},  // 2
+    {0x00,0x0E,0x11,0x01,0x0E,0x01,0x11,0x0E,0x00,0x00},  // 3
+    {0x00,0x02,0x06,0x0A,0x1A,0x1F,0x02,0x02,0x00,0x00},  // 4
+    {0x00,0x1E,0x10,0x1E,0x01,0x01,0x01,0x1E,0x00,0x00},  // 5
+    {0x00,0x0F,0x18,0x10,0x1E,0x11,0x11,0x0E,0x00,0x00},  // 6
+    {0x00,0x1F,0x03,0x02,0x02,0x04,0x04,0x08,0x00,0x00},  // 7
+    {0x00,0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E,0x00,0x00},  // 8
+    {0x00,0x0E,0x11,0x11,0x0F,0x01,0x03,0x1E,0x00,0x00},  // 9
+    {0x00,0x00,0x00,0x08,0x00,0x00,0x00,0x08,0x00,0x00},  // :
+    {0x00,0x00,0x00,0x08,0x00,0x00,0x00,0x08,0x08,0x08},  // ;
+    {0x00,0x00,0x01,0x0E,0x10,0x0E,0x01,0x00,0x00,0x00},  // <
+    {0x00,0x00,0x00,0x3E,0x00,0x3E,0x00,0x00,0x00,0x00},  // =
+    {0x00,0x00,0x10,0x0E,0x01,0x0E,0x10,0x00,0x00,0x00},  // >
+    {0x00,0x1E,0x02,0x04,0x08,0x08,0x00,0x08,0x00,0x00},  // ?
+    {0x00,0x0E,0x09,0x17,0x15,0x15,0x15,0x17,0x08,0x06},  // @
+    {0x00,0x04,0x04,0x0A,0x0A,0x0E,0x11,0x11,0x00,0x00},  // A
+    {0x00,0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E,0x00,0x00},  // B
+    {0x00,0x0F,0x19,0x10,0x10,0x10,0x19,0x0F,0x00,0x00},  // C
+    {0x00,0x1E,0x13,0x11,0x11,0x11,0x13,0x1E,0x00,0x00},  // D
+    {0x00,0x1F,0x10,0x10,0x1F,0x10,0x10,0x1F,0x00,0x00},  // E
+    {0x00,0x1F,0x10,0x10,0x1F,0x10,0x10,0x10,0x00,0x00},  // F
+    {0x00,0x0E,0x19,0x10,0x13,0x11,0x19,0x0F,0x00,0x00},  // G
+    {0x00,0x11,0x11,0x11,0x1F,0x11,0x11,0x11,0x00,0x00},  // H
+    {0x00,0x1F,0x04,0x04,0x04,0x04,0x04,0x1F,0x00,0x00},  // I
+    {0x00,0x0E,0x02,0x02,0x02,0x02,0x12,0x0C,0x00,0x00},  // J
+    {0x00,0x11,0x12,0x14,0x18,0x14,0x12,0x11,0x00,0x00},  // K
+    {0x00,0x10,0x10,0x10,0x10,0x10,0x10,0x1F,0x00,0x00},  // L
+    {0x00,0x11,0x1B,0x1B,0x15,0x11,0x11,0x11,0x00,0x00},  // M
+    {0x00,0x11,0x19,0x19,0x15,0x13,0x13,0x11,0x00,0x00},  // N
+    {0x00,0x0E,0x11,0x11,0x11,0x11,0x11,0x0E,0x00,0x00},  // O
+    {0x00,0x1E,0x11,0x11,0x1E,0x10,0x10,0x10,0x00,0x00},  // P
+    {0x00,0x0E,0x11,0x11,0x11,0x11,0x11,0x0E,0x03,0x00},  // Q
+    {0x00,0x1E,0x11,0x11,0x1E,0x13,0x11,0x10,0x00,0x00},  // R
+    {0x00,0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E,0x00,0x00},  // S
+    {0x00,0x1F,0x04,0x04,0x04,0x04,0x04,0x04,0x00,0x00},  // T
+    {0x00,0x11,0x11,0x11,0x11,0x11,0x11,0x0E,0x00,0x00},  // U
+    {0x00,0x11,0x11,0x0A,0x0A,0x0A,0x04,0x04,0x00,0x00},  // V
+    {0x00,0x21,0x2D,0x2D,0x1E,0x12,0x12,0x12,0x00,0x00},  // W
+    {0x00,0x11,0x0A,0x0A,0x04,0x0A,0x0A,0x11,0x00,0x00},  // X
+    {0x00,0x11,0x0A,0x0A,0x04,0x04,0x04,0x04,0x00,0x00},  // Y
+    {0x00,0x1F,0x02,0x02,0x04,0x08,0x08,0x1F,0x00,0x00},  // Z
+    {0x0C,0x08,0x08,0x08,0x08,0x08,0x08,0x08,0x0C,0x00},  // [
+    {0x00,0x10,0x08,0x08,0x04,0x04,0x02,0x02,0x01,0x00},  // backslash
+    {0x0C,0x04,0x04,0x04,0x04,0x04,0x04,0x04,0x0C,0x00},  // ]
+    {0x00,0x08,0x14,0x22,0x00,0x00,0x00,0x00,0x00,0x00},  // ^
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3F},  // _
+    {0x10,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},  // `
+    {0x00,0x00,0x00,0x1E,0x01,0x0F,0x11,0x1F,0x00,0x00},  // a
+    {0x10,0x10,0x10,0x1E,0x11,0x11,0x11,0x1E,0x00,0x00},  // b
+    {0x00,0x00,0x00,0x0E,0x10,0x10,0x10,0x0E,0x00,0x00},  // c
+    {0x01,0x01,0x01,0x0F,0x11,0x11,0x11,0x0F,0x00,0x00},  // d
+    {0x00,0x00,0x00,0x0E,0x11,0x1F,0x10,0x0F,0x00,0x00},  // e
+    {0x06,0x08,0x08,0x1E,0x08,0x08,0x08,0x08,0x00,0x00},  // f
+    {0x00,0x00,0x00,0x0F,0x11,0x11,0x11,0x0F,0x01,0x0E},  // g
+    {0x10,0x10,0x10,0x16,0x19,0x11,0x11,0x11,0x00,0x00},  // h
+    {0x04,0x00,0x00,0x0C,0x04,0x04,0x04,0x1F,0x00,0x00},  // i
+    {0x04,0x00,0x00,0x1C,0x04,0x04,0x04,0x04,0x04,0x18},  // j
+    {0x10,0x10,0x10,0x12,0x14,0x1C,0x12,0x11,0x00,0x00},  // k
+    {0x38,0x08,0x08,0x08,0x08,0x08,0x08,0x06,0x00,0x00},  // l
+    {0x00,0x00,0x00,0x1F,0x15,0x15,0x15,0x15,0x00,0x00},  // m
+    {0x00,0x00,0x00,0x16,0x19,0x11,0x11,0x11,0x00,0x00},  // n
+    {0x00,0x00,0x00,0x0E,0x11,0x11,0x11,0x0E,0x00,0x00},  // o
+    {0x00,0x00,0x00,0x1E,0x11,0x11,0x11,0x1E,0x10,0x10},  // p
+    {0x00,0x00,0x00,0x0F,0x11,0x11,0x11,0x0F,0x01,0x01},  // q
+    {0x00,0x00,0x00,0x0F,0x09,0x08,0x08,0x08,0x00,0x00},  // r
+    {0x00,0x00,0x00,0x0F,0x10,0x0F,0x01,0x1E,0x00,0x00},  // s
+    {0x00,0x08,0x08,0x1E,0x08,0x08,0x08,0x0E,0x00,0x00},  // t
+    {0x00,0x00,0x00,0x11,0x11,0x11,0x11,0x0F,0x00,0x00},  // u
+    {0x00,0x00,0x00,0x11,0x0A,0x0A,0x0A,0x04,0x00,0x00},  // v
+    {0x00,0x00,0x00,0x11,0x15,0x0A,0x0A,0x0A,0x00,0x00},  // w
+    {0x00,0x00,0x00,0x1B,0x0A,0x04,0x0A,0x1B,0x00,0x00},  // x
+    {0x00,0x00,0x00,0x11,0x0A,0x0A,0x04,0x04,0x04,0x18},  // y
+    {0x00,0x00,0x00,0x1F,0x02,0x04,0x08,0x1F,0x00,0x00},  // z
+    {0x06,0x04,0x04,0x04,0x18,0x04,0x04,0x04,0x06,0x00},  // {
+    {0x04,0x04,0x04,0x04,0x04,0x04,0x04,0x04,0x04,0x04},  // |
+    {0x0C,0x04,0x04,0x04,0x03,0x04,0x04,0x04,0x0C,0x00},  // }
+    {0x00,0x00,0x00,0x00,0x1C,0x03,0x00,0x00,0x00,0x00},  // ~
+};
+
+
+static s32 isqrt32(u32 v) {
+    u32 r = 0, b = 1u << 30;
+    while (b > v) b >>= 2;
+    while (b) {
+        if (v >= r + b) { v -= r + b; r = (r >> 1) + b; }
+        else r >>= 1;
+        b >>= 2;
+    }
+    return (s32)r;
+}
+
+static void clearScreen(u16 *s, u16 c) {
+    for (int i = 0; i < VW * VH; i++) s[i] = c;
+}
+
+static void rect(u16 *s, int x, int y, int w, int h, u16 c) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > VW) w = VW - x;
+    if (y + h > VH) h = VH - y;
+    if (w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        u16 *p = s + (y + j) * VW + x;
+        for (int i = 0; i < w; i++) p[i] = c;
+    }
+}
+
+// rectangulo con las esquinas cortadas (1 px)
+static void pill(u16 *s, int x, int y, int w, int h, u16 c) {
+    rect(s, x + 1, y, w - 2, h, c);
+    rect(s, x, y + 1, w, h - 2, c);
+}
+
+static int textW(const char *t, int sc) { return (int)strlen(t) * FONT_W * sc; }
+
+static void glyph(u16 *s, int x, int y, int ch, u16 c, int sc) {
+    if (ch < 32 || ch > 126) ch = '?';
+    if (x < 0 || y < 0 || x + FONT_W * sc > VW || y + FONT_H * sc > VH) return;
+    const u8 *g = font6[ch - 32];
+    for (int r = 0; r < FONT_H; r++) {
+        u8 bits = g[r];
+        if (!bits) continue;
+        for (int k = 0; k < FONT_W; k++) {
+            if (!(bits & (0x20 >> k))) continue;
+            if (sc == 1) s[(y + r) * VW + x + k] = c;
+            else         rect(s, x + k * sc, y + r * sc, sc, sc, c);
+        }
+    }
+}
+
+static void text(u16 *s, int x, int y, const char *t, u16 c, int sc) {
+    for (; *t; t++, x += FONT_W * sc) glyph(s, x, y, (unsigned char)*t, c, sc);
+}
+
+// tecla en naranja + descripcion en gris; avanza x
+static void keyHint(int *x, int y, const char *key, const char *label) {
+    text(fbTop, *x, y, key, C_ORG, 1);
+    *x += textW(key, 1) + 4;
+    text(fbTop, *x, y, label, C_GRAY, 1);
+    *x += textW(label, 1) + 10;
+}
+
+static void drawHeader(const char *a, const char *b, u16 ca) {
+    rect(fbTop, 0, 0, VW, 16, C_PANEL);
+    rect(fbTop, 0, 0, 4, 16, C_ORG);
+    text(fbTop, 10, 3, a, ca, 1);
+    if (b) text(fbTop, 10 + textW(a, 1) + 8, 3, b, C_LGRAY, 1);
+}
+
+// pantallas de carga / error (arriba)
+static void drawLoadScreen(const char *name) {
+    clearScreen(fbTop, C_BG);
+    drawHeader("CARGANDO", NULL, C_YEL);
+    char t[36];
+    snprintf(t, sizeof t, "%.34s", name);
+    text(fbTop, 8, 40, t, C_WHITE, 1);
+    rect(fbTop, 8, 62, 240, 8, C_PANEL2);
+}
+
+static void drawLoadBar(int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    rect(fbTop, 8, 62, 240 * pct / 100, 8, C_ORG);
+    char t[8];
+    snprintf(t, sizeof t, "%3d%%", pct);
+    rect(fbTop, 8, 76, 40, 10, C_BG);
+    text(fbTop, 8, 76, t, C_YEL, 1);
+}
+
+static void drawLoadNote(const char *note) {
+    rect(fbTop, 8, 92, 240, 10, C_BG);
+    text(fbTop, 8, 92, note, C_GRAY, 1);
+}
+
+static void drawErrorScreen(const char *msg) {
+    clearScreen(fbTop, C_BG);
+    drawHeader("ERROR", NULL, C_ORG);
+    char t[38];
+    snprintf(t, sizeof t, "%.36s", msg);
+    text(fbTop, 8, 40, t, C_WHITE, 1);
+    int x = 8;
+    keyHint(&x, 176, "A", "volver");
+}
+
+// ---------------------------------------------------------------- reverb (Schroeder: 4 combs + 2 allpass)
+typedef struct { s16 *buf; u32 len, idx; s32 lp; } Comb;
+static s16 cb0[1789], cb1[1999], cb2[2237], cb3[2459], ab0[557], ab1[421], ab2[509], ab3[379];
+static Comb combs[4] = { { cb0, 1789, 0, 0 }, { cb1, 1999, 0, 0 }, { cb2, 2237, 0, 0 }, { cb3, 2459, 0, 0 } };
+static Comb aps[2]   = { { ab0, 557, 0, 0 }, { ab1, 421, 0, 0 } };
+static Comb apsR[2]  = { { ab2, 509, 0, 0 }, { ab3, 379, 0, 0 } };
+static s32 revMix = 51, revFb = 220, revDamp = 80;      // Q8
+
+static void updateReverb(void) {
+    revMix = revMixPct * 256 / 100;
+    revFb  = 179 + decayPct * 69 / 100;                  // 0.70 .. 0.97
+}
+
+static s32 apRun(Comb *a, s32 w) {                       // difusion (allpass)
+    s32 z = a->buf[a->idx];
+    s32 v = clamp16(w + (z >> 1));
+    a->buf[a->idx] = (s16)v;
+    if (++a->idx >= a->len) a->idx = 0;
+    return z - (v >> 1);
+}
+
+// entrada mono (suma de L y R); los 4 combs se mezclan con signos distintos para cada oido,
+// asi la cola sale ancha y descorrelacionada
+static void reverbProcess(s32 inL, s32 inR, s32 *wl, s32 *wr) {
+    s32 x = (((inL + inR) >> 1) * (256 - revFb)) >> 8;   // compensa la ganancia de la realimentacion
+    s32 y[4];
+    for (int i = 0; i < 4; i++) {
+        Comb *c = &combs[i];
+        y[i] = c->buf[c->idx];
+        c->lp += ((y[i] - c->lp) * revDamp) >> 8;        // amortiguacion: la cola se oscurece
+        c->buf[c->idx] = (s16)clamp16(x + ((c->lp * revFb) >> 8));
+        if (++c->idx >= c->len) c->idx = 0;
+    }
+    s32 l = (y[0] - y[1] + y[2] - y[3]) >> 2;
+    s32 r = (y[0] + y[1] - y[2] - y[3]) >> 2;
+    l = apRun(&aps[1], apRun(&aps[0], l));
+    r = apRun(&apsR[1], apRun(&apsR[0], r));
+    *wl = l; *wr = r;
+}
+
+// ---------------------------------------------------------------- motor
+// Volumen automatico: el sample ya esta normalizado por su pico, pero la musica real tiene
+// mucho mas pico que promedio y suena bajito. Medimos el RMS y subimos hasta ~-9 dBFS
+// (maximo +16 dB); el limitador suave de la salida se encarga de los picos.
+static void computeAuto(void) {
+    u64 sum = 0;
+    u32 n = 0, step = dk->srcLen > 200000 ? 4 : 1;
+    for (u32 i = 0; i < dk->srcLen; i += step) { s32 v = dk->src[i]; sum += (u32)(v * v); n++; }
+    s32 rms = n ? isqrt32((u32)(sum / n)) : 1;
+    if (rms < 1) rms = 1;
+    s32 q = 44 * 256 / rms;
+    if (q < 256) q = 256;
+    if (q > 1664) q = 1664;
+    dk->autoQ = q;
+}
+
+static void updateIncOne(void) {
+    dk->gainC = (gain * dk->autoQ) >> 8;
+    dk->gainT = (((gain * 2) / 5) * dk->autoQ) >> 8;
+    float base = (float)dk->srcRate / 32728.5f;                    // frecuencia del sample -> salida
+    dk->inc16    = (u32)(65536.0f * base * exp2f(dk->semis / 12.0f));
+    dk->cleanInc = (u32)(65536.0f * base);
+    dk->scanInc  = (s32)(65536.0f * base * (dk->speedPct / 100.0f));
+    float ov = (float)density * (float)sizeMs / 1000.0f;       // granos solapados en promedio
+    normQ    = (s32)(256.0f / sqrtf(ov < 1.0f ? 1.0f : ov));
+    fadeStep = (s32)((float)MIX_FULL / (fadeSec[fadeIdx] * 32728.5f));
+    if (fadeStep < 1) fadeStep = 1;
+}
+
+static void updateInc(void) {                                   // los parametros compartidos tocan a los dos decks
+    Deck *keep = dk;
+    for (int i = 0; i < 2; i++) { dk = &decks[i]; updateIncOne(); }
+    dk = keep;
+}
+
+static void setXfade(s32 v) {
+    xfade = clampi(v, 0, 256);
+    float a = 1.5707963f * (float)xfade / 256.0f;
+    xfGainA = (s32)(256.0f * cosf(a) + 0.5f);
+    xfGainB = (s32)(256.0f * sinf(a) + 0.5f);
+}
+
+static void killGrains(void) {
+    for (int g = 0; g < MAX_GRAINS; g++) dk->grains[g].on = false;
+    dk->untilSpawn = 1;
+}
+
+static s32 minLoop(void) { s32 m = (s32)(dk->srcLen / 4); return m > 2000 ? 2000 : m; }
+
+static void resetTransport(bool autoplay, bool loop) {
+    dk->posI = 0; dk->posF = 0;
+    dk->loopStart = 0; dk->loopEnd = (s32)dk->srcLen - 1;
+    dk->loopOn = true;                           // siempre en loop
+    dk->playing = autoplay;
+    dk->dropOn = false; dk->mixQ = 0; dk->trackI = 0; dk->trackF = 0; dk->driftW = 0;
+    killGrains();
+}
+
+static void seekTo(s32 idx) {
+    dk->posI = clampi(idx, 0, (s32)dk->srcLen - 1);
+    dk->posF = 0;
+}
+
+static void togglePlay(void) {
+    if (!dk->playing) {
+        if (!dk->dropOn && !dk->loopOn && dk->posI >= (s32)dk->srcLen - 2) seekTo(0);   // estaba al final: vuelve a empezar
+        dk->playing = true;
+    } else {
+        dk->playing = false;
+    }
+}
+
+static void fixLoop(bool movedStart) {
+    if (dk->loopStart < 0) dk->loopStart = 0;
+    if (dk->loopEnd > (s32)dk->srcLen - 1) dk->loopEnd = (s32)dk->srcLen - 1;
+    s32 m = minLoop();
+    if (dk->loopEnd - dk->loopStart < m) {
+        if (movedStart) {
+            dk->loopEnd = dk->loopStart + m;
+            if (dk->loopEnd > (s32)dk->srcLen - 1) { dk->loopEnd = (s32)dk->srcLen - 1; dk->loopStart = dk->loopEnd - m; }
+        } else {
+            dk->loopStart = dk->loopEnd - m;
+            if (dk->loopStart < 0) { dk->loopStart = 0; dk->loopEnd = m; }
+        }
+    }
+}
+
+static void toggleLoop(void) {
+    loopEdit = !loopEdit;
+}
+
+// avanza la cabeza una muestra de salida
+static inline void advancePos(void) {
+    dk->posF += dk->scanInc;
+    dk->posI += dk->posF >> 16;
+    dk->posF &= 0xFFFF;
+    if (dk->loopOn) {
+        if (dk->scanInc > 0 && dk->posI >= dk->loopEnd) {
+            dk->posI = dk->loopStart + (dk->posI - dk->loopEnd);
+            if (dk->posI >= dk->loopEnd) dk->posI = dk->loopStart;
+        } else if (dk->scanInc < 0 && dk->posI < dk->loopStart) {
+            dk->posI = dk->loopEnd - (dk->loopStart - dk->posI);
+            if (dk->posI < dk->loopStart) dk->posI = dk->loopEnd - 1;
+        }
+    } else if (dk->posI >= (s32)dk->srcLen - 1) {
+        dk->posI = (s32)dk->srcLen - 1; dk->posF = 0; dk->playing = false;      // fin del track
+    } else if (dk->posI < 0) {
+        dk->posI = 0; dk->posF = 0; dk->playing = false;
+    }
+}
+
+// ---- delay estereo ping-pong (1 s maximo por lado)
+#define DLY_LEN   32768
+#define DLY_MASK  (DLY_LEN - 1)
+static s16 dlyL[DLY_LEN], dlyR[DLY_LEN];
+static u32 dW = 0;
+static s32 dtCur = 0, dtTgt = 0;              // tiempo actual / objetivo en muestras Q8 (el actual se desliza)
+static s32 dFb = 115, dMix = 0, dLpL = 0, dLpR = 0;
+
+static void updateDelay(void) {
+    dtTgt = (s32)((float)delayMs * 32.7285f * 256.0f);
+    dFb   = delayFbPct * 256 / 100;
+    dMix  = delayPct * 256 / 100;
+}
+
+// ---- estereo, shimmer y filtro
+static s32 panTab[33];                        // ganancias Q8 de potencia constante (centro = 256 en cada oido)
+static s32 shimRatio[4];                      // razones Q16 de +12, +24, +19 y -12 semitonos
+static s32 aTab[128], fcHz[128];              // coeficiente (Q15) y frecuencia del filtro por paso
+static s32 fS[2][2];                          // estados del filtro (L, R) de 2 polos
+static s32 aCur = 32768, aTgt = 32768;
+static u32 lfoPh = 0, shPh = 0;               // fases: barrido del filtro (~12 s) y fundido del shimmer (~17 s)
+static u32 fCnt = 0;
+#define LFO_INC   10938u                      // 2^32 / (12 s * 32728.5 Hz)
+#define SHIM_INC  7720u                       // 2^32 / (17 s * 32728.5 Hz)
+
+static void initTables(void) {
+    for (int i = 0; i <= 32; i++) panTab[i] = (s32)(362.0f * cosf((float)i * 3.14159265f / 64.0f));
+    shimRatio[0] = (s32)(65536.0f * exp2f(12.0f / 12.0f));
+    shimRatio[1] = (s32)(65536.0f * exp2f(24.0f / 12.0f));
+    shimRatio[2] = (s32)(65536.0f * exp2f(19.0f / 12.0f));
+    shimRatio[3] = (s32)(65536.0f * exp2f(-12.0f / 12.0f));
+    for (int c = 0; c < 128; c++) {
+        float fc = 40.0f * exp2f((float)c * 7.81f / 127.0f);       // 40 Hz .. ~9 kHz
+        float a = 1.0f - expf(-6.2831853f * fc / 32728.5f);
+        fcHz[c] = (s32)fc;
+        aTab[c] = (s32)(32768.0f * a);
+    }
+}
+
+// triangulo suavizado 0..256 a partir de una fase de 32 bit
+static s32 smooth01(u32 ph) {
+    u32 t = ph < 0x80000000u ? ph : ~ph;
+    s32 x = (s32)(t >> 16);
+    if (x > 32767) x = 32767;
+    s32 x2 = (x * x) >> 15;
+    s32 v = 3 * x2 - ((2 * x2 * x) >> 15);
+    return v >> 7;
+}
+
+static void filterTarget(void) {
+    if (filtPct >= 100 && !sweepPct) { aTgt = 32768; return; }
+    s32 c = filtPct * 127 / 100;
+    if (sweepPct) c -= sweepPct * smooth01(lfoPh) / 256;       // el barrido baja el corte desde el valor fijado
+    aTgt = aTab[clampi(c, 0, 127)];
+}
+
+static inline s32 lp2(s32 *st, s32 x) {
+    st[0] += (((x - st[0]) >> 3) * aCur) >> 12;
+    st[1] += (((st[0] - st[1]) >> 3) * aCur) >> 12;
+    return st[1];
+}
+
+static void spawn(void) {
+    for (int g = 0; g < MAX_GRAINS; g++) {
+        if (dk->grains[g].on) continue;
+        s32 sp = (s32)(sprayMs * dk->srcRate / 1000);
+        s32 start = dk->posI + (s32)(rnd() % (u32)(2 * sp + 1)) - sp;
+        if (driftPct) {                                           // deriva: caminata aleatoria con retorno suave
+            s32 step = (s32)(driftPct * dk->srcRate / 1000);
+            dk->driftW += (s32)(rnd() % (u32)(2 * step + 1)) - step;
+            dk->driftW -= dk->driftW / 32;
+            start += dk->driftW;
+        }
+        s32 inc = (s32)dk->inc16, amp = 256;
+        bool shim = false;
+        if (shimPct) {                                            // shimmer: octavas que suben y bajan de a poco
+            s32 env = smooth01(shPh);
+            if ((s32)(rnd() % 100) < shimPct * env / 256) {
+                u32 r = rnd() % 100;
+                inc = (s32)(((u64)(u32)inc * (u32)shimRatio[r < 55 ? 0 : (r < 80 ? 1 : (r < 92 ? 2 : 3))]) >> 16);
+                amp = 64 + env * 192 / 256;
+                shim = true;
+            }
+        }
+        if (!shim && harmPct && (rnd() % 100) < (u32)harmPct)     // armonia: grano transpuesto
+            inc = (s32)(((u64)(u32)inc * (u32)harmRatio[rnd() & 3]) >> 16);
+        if (jitterC) {                                            // desafinacion aleatoria en cents
+            s32 j = (s32)(rnd() % (u32)(2 * jitterC + 1)) - jitterC;
+            inc += (inc * j) / 1731;
+        }
+        u32 len = (u32)(sizeMs * OUT_RATE / 1000);
+        if (shim) len += len >> 1;                                // los granos shimmer son mas largos
+        if (revPct && (rnd() % 100) < (u32)revPct) {              // grano al reves: parte del final
+            start += (s32)(((len >> 4) * ((u32)inc >> 4)) >> 8);
+            inc = -inc;
+        }
+        start = clampi(start, 0, (s32)dk->srcLen - 2);
+        s32 span = panPct * 16 / 100;                             // panorama: posicion 0..32, centro 16
+        s32 pp = 16 + (s32)(rnd() % (u32)(2 * span + 1)) - span;
+        dk->grains[g].ipos = (u32)start;
+        dk->grains[g].fpos = 0;
+        dk->grains[g].inc  = inc;
+        dk->grains[g].wpos = 0;
+        dk->grains[g].winc = ((u32)WIN_LEN << 16) / len;
+        dk->grains[g].pl   = panTab[pp];
+        dk->grains[g].pr   = panTab[32 - pp];
+        dk->grains[g].amp  = amp;
+        dk->grains[g].shim = shim;
+        dk->grains[g].on   = true;
+        return;
+    }
+}
+
+// limitador suave: lineal hasta 16384 y luego comprime hacia 32767 (sin clipping duro)
+static s32 softClip(s32 x) {
+    s32 a = x < 0 ? -x : x;
+    if (a > 16384) {
+        s32 d = a - 16384;
+        if (d > 65535) d = 65535;
+        a = 16384 + (d * 16383) / (d + 16383);
+    }
+    return x < 0 ? -a : a;
+}
+
+// todo en enteros: el ARM9 no tiene FPU
+#define SCALE(v) ((((v) * normQ >> 8) * dk->gainC) >> 4)
+
+// un deck: nube de granos (directo + envio a la reverb) y voz limpia; xg = ganancia del crossfader (Q8)
+static void deckRender(Deck *d, s32 xg, s32 *oDL, s32 *oDR, s32 *oSL, s32 *oSR, s32 *oT) {
+    dk = d;
+    *oDL = *oDR = *oSL = *oSR = *oT = 0;
+    if (dk->dropOn) {
+        if (dk->mixQ < MIX_FULL) {
+            dk->mixQ += fadeStep;
+            if (dk->mixQ >= MIX_FULL) { dk->mixQ = MIX_FULL; killGrains(); }   // la nube ya no se oye: no gasta CPU
+        }
+    } else if (dk->mixQ > 0) {
+        dk->mixQ -= fadeStep;
+        if (dk->mixQ < 0) dk->mixQ = 0;
+    }
+
+    s32 dL = 0, dR = 0, sL = 0, sR = 0;
+    if (dk->mixQ < MIX_FULL) {
+        if (dk->playing && !(touching && d == &decks[actDeck]) && !(freezeKey && d == &decks[actDeck])) advancePos();
+        if (xg < 6) {
+            killGrains();                               // deck apagado por el crossfader: solo avanza la cinta
+        } else {
+            if (dk->playing || (touching && d == &decks[actDeck])) {
+                if (--dk->untilSpawn <= 0) { spawn(); dk->untilSpawn = OUT_RATE / density; }
+            }
+            s32 aL = 0, aR = 0, zL = 0, zR = 0;
+            for (int g = 0; g < MAX_GRAINS; g++) {
+                Grain *gr = &dk->grains[g];
+                if (!gr->on) continue;
+                u32 si = gr->ipos;
+                if (si >= dk->srcLen - 1 || gr->wpos >= ((u32)WIN_LEN << 16)) { gr->on = false; continue; }
+                s32 a = dk->src[si], b = dk->src[si + 1];
+                s32 s = a + (((b - a) * (gr->fpos >> 8)) >> 8);        // interpolacion lineal
+                u32 wi = gr->wpos >> 16;
+                s32 w = win[wi] + (((win[wi + 1] - win[wi]) * (s32)((gr->wpos >> 8) & 0xFF)) >> 8);
+                s32 v = (((s * w) >> 7) * gr->amp) >> 8;                // s8 -> s16 con ventana Q15
+                s32 vl = (v * gr->pl) >> 8, vr = (v * gr->pr) >> 8;
+                if (gr->shim) { zL += vl; zR += vr; } else { aL += vl; aR += vr; }
+                s32 f = gr->fpos + gr->inc;
+                gr->ipos += (u32)(f >> 16);
+                gr->fpos  = f & 0xFFFF;
+                gr->wpos += gr->winc;
+            }
+            // el shimmer se oye poco directo y mucho dentro de la reverb
+            dL = softClip(SCALE(aL + ((zL * 90) >> 8)));
+            dR = softClip(SCALE(aR + ((zR * 90) >> 8)));
+            sL = softClip(SCALE(aL + zL + (zL >> 1)));
+            sR = softClip(SCALE(aR + zR + (zR >> 1)));
+        }
+    }
+    s32 fadeG = ((32768 - (dk->mixQ >> 9)) * xg) >> 8;             // Q15: fundido del DROP x crossfader
+    *oDL = (dL * fadeG) >> 15; *oDR = (dR * fadeG) >> 15;
+    *oSL = (sL * fadeG) >> 15; *oSR = (sR * fadeG) >> 15;
+
+    // voz limpia: el track tal cual, 1x, sin pitch, sin granos
+    if (dk->dropOn || dk->mixQ > 0) {
+        if (dk->playing) { dk->trackGate += 50; if (dk->trackGate > 32768) dk->trackGate = 32768; }
+        else if (dk->trackGate > 0) { dk->trackGate -= 50; if (dk->trackGate < 0) dk->trackGate = 0; }
+        if (dk->playing || dk->trackGate > 0) {
+            u32 ti = (u32)dk->trackI;
+            if (ti >= dk->srcLen - 1) {                                 // fin de la cancion
+                dk->dropOn = false; dk->posI = (s32)dk->srcLen - 1; dk->posF = 0; dk->playing = false;
+            } else {
+                s32 a = dk->src[ti], b = dk->src[ti + 1];
+                s32 s = a + (((b - a) * (dk->trackF >> 8)) >> 8);
+                s32 x = ((s * 256 * dk->gainT) >> 4);
+                if (x > 262143) x = 262143;                              // con mucha ganancia automatica: evita desbordar el producto
+                if (x < -262143) x = -262143;
+                s32 tr = (x * (dk->trackGate >> 3)) >> 12;
+                tr = (tr * (dk->mixQ >> 12)) >> 12;                     // el fundido sube el track mientras baja la nube
+                *oT = (tr * xg) >> 8;
+                dk->trackF += (s32)dk->cleanInc;
+                dk->trackI += dk->trackF >> 16;
+                dk->trackF &= 0xFFFF;
+            }
+        }
+    }
+}
+
+static void render(s16 *dstL, s16 *dstR, int n) {
+    Deck *keep = dk;
+    for (int i = 0; i < n; i++) {
+        lfoPh += LFO_INC;
+        shPh  += SHIM_INC;
+        if ((++fCnt & 31) == 0) filterTarget();
+        aCur += (aTgt - aCur) >> 6;
+
+        s32 dL[2], dR[2], sL[2], sR[2], tr[2];
+        deckRender(&decks[0], xfGainA, &dL[0], &dR[0], &sL[0], &sR[0], &tr[0]);
+        deckRender(&decks[1], xfGainB, &dL[1], &dR[1], &sL[1], &sR[1], &tr[1]);
+
+        // reverb estereo sobre las dos nubes
+        s32 wl, wr;
+        reverbProcess(clamp16(sL[0] + sL[1]), clamp16(sR[0] + sR[1]), &wl, &wr);
+        s32 cmL = ((dL[0] + dL[1]) * (256 - (revMix >> 1)) + wl * revMix) >> 8;
+        s32 cmR = ((dR[0] + dR[1]) * (256 - (revMix >> 1)) + wr * revMix) >> 8;
+        s32 trk = tr[0] + tr[1];
+        s32 tr_ = trk;
+        // delay ping-pong: entra mono por la izquierda y cada eco rebota al otro lado
+        s32 oL = cmL + tr_, oR = cmR + tr_;
+        if (dtCur < dtTgt)      { dtCur += 96; if (dtCur > dtTgt) dtCur = dtTgt; }
+        else if (dtCur > dtTgt) { dtCur -= 96; if (dtCur < dtTgt) dtCur = dtTgt; }
+        {
+            s32 dn = dtCur >> 8, df = dtCur & 255;
+            u32 r0 = (dW - (u32)dn) & DLY_MASK, r1 = (r0 - 1) & DLY_MASK;
+            s32 eL = dlyL[r0] + (((dlyL[r1] - dlyL[r0]) * df) >> 8);
+            s32 eR = dlyR[r0] + (((dlyR[r1] - dlyR[r0]) * df) >> 8);
+            dLpL += ((((eR * dFb) >> 8) - dLpL) * 180) >> 8;        // la repeticion se oscurece un poco
+            dLpR += ((((eL * dFb) >> 8) - dLpR) * 180) >> 8;
+            dlyL[dW] = (s16)clamp16(((oL + oR) >> 1) + dLpL);
+            dlyR[dW] = (s16)clamp16(dLpR);
+            dW = (dW + 1) & DLY_MASK;
+            oL += (eL * dMix) >> 8;
+            oR += (eR * dMix) >> 8;
+        }
+
+        // filtro pasa-bajos de toda la salida (con el filtro abierto solo sigue la senal, sin gastar)
+        if (aCur >= 32700 && aTgt >= 32768) {
+            fS[0][0] = fS[0][1] = oL;
+            fS[1][0] = fS[1][1] = oR;
+        } else {
+            oL = lp2(fS[0], oL);
+            oR = lp2(fS[1], oR);
+        }
+        dstL[i] = (s16)clamp16(softClip(oL));                   // limitador suave en la salida
+        dstR[i] = (s16)clamp16(softClip(oR));
+    }
+    dk = keep;
+}
+
+// ---------------------------------------------------------------- sample
+static void freeHeap(void) { if (dk->heapBuf) { free(dk->heapBuf); dk->heapBuf = NULL; } }
+
+static void resetSrc(void) {
+    dk->playing = false; dk->dropOn = false; dk->mixQ = 0;
+    killGrains();                                        // nada puede leer el buffer que vamos a liberar
+    freeHeap();
+    dk->src = demoBuf; dk->srcLen = DEMO_LEN; dk->srcRate = DEMO_RATE;
+    dk->lostSample = true;
+}
+
+static void useDemo(const char *name) {
+    freeHeap();
+    dk->src = demoBuf; dk->srcLen = DEMO_LEN; dk->srcRate = DEMO_RATE;
+    dk->lostSample = false;
+    strncpy(dk->curName, name, sizeof(dk->curName) - 1);
+    computeAuto();
+    updateInc();
+    resetTransport(true, true);                  // demo: suena en loop de inmediato
+    computePeaks();
+}
+
+// ---------------------------------------------------------------- WAV + cache
+static void wr32(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
+
+// Cache: "<archivo>.wav.gr8" = cabecera de 16 bytes ('G','R','8',3, tamano del wav,
+// frecuencia, largo) + muestras s8 ya normalizadas. Si el WAV cambia de tamano, se regenera.
+static bool loadCache(const char *name, u32 wavSize) {
+    char cn[160];
+    snprintf(cn, sizeof(cn), "%s.gr8", name);
+    FILE *f = fopen(cn, "rb");
+    if (!f) return false;
+    u8 h[16];
+    if (fread(h, 1, 16, f) != 16 || h[0] != 'G' || h[1] != 'R' || h[2] != '8' || h[3] != 4 ||
+        rd32(h + 4) != wavSize) { fclose(f); return false; }
+    u32 rate = rd32(h + 8), len = rd32(h + 12);
+    if (rate < 1000 || rate > 48000 || len < 256 || len > 1300000) { fclose(f); return false; }
+    resetSrc();
+    s8 *buf = (s8 *)malloc(len);
+    if (!buf) { fclose(f); return false; }
+    size_t got = 0;
+    while (got < len) {                                  // por tandas: el otro deck sigue sonando
+        size_t n = len - got;
+        if (n > 2048) n = 2048;
+        size_t r = fread(buf + got, 1, n, f);
+        got += r;
+        audioTick();
+        if (r != n) break;
+    }
+    fclose(f);
+    if (got != len) { free(buf); return false; }
+    dk->heapBuf = buf; dk->src = buf; dk->srcLen = len; dk->srcRate = rate;
+    dk->lostSample = false;
+    strncpy(dk->curName, name, sizeof(dk->curName) - 1);
+    computeAuto();
+    updateInc();
+    resetTransport(false, false);                // los tracks cargan en pausa, al inicio
+    computePeaks();
+    return true;
+}
+
+static void saveCache(const char *name, u32 wavSize, const s8 *buf, u32 len, u32 rate) {
+    char cn[160];
+    snprintf(cn, sizeof(cn), "%s.gr8", name);
+    FILE *f = fopen(cn, "wb");
+    if (!f) return;                                   // SD protegida o sin permisos: no pasa nada
+    u8 h[16] = { 'G', 'R', '8', 4 };
+    wr32(h + 4, wavSize); wr32(h + 8, rate); wr32(h + 12, len);
+    bool ok = (fwrite(h, 1, 16, f) == 16);
+    for (u32 o = 0; ok && o < len; ) {
+        u32 n = len - o;
+        if (n > 2048) n = 2048;
+        audioTick();
+        ok = (fwrite(buf + o, 1, n, f) == n);
+        o += n;
+    }
+    fclose(f);
+    if (!ok) remove(cn);
+}
+
+// devuelve NULL si todo bien, o un mensaje de error
+static const char *loadWav(const char *name) {
+    FILE *f = fopen(name, "rb");
+    if (!f) return "no se pudo abrir";
+
+    fseek(f, 0, SEEK_END);
+    u32 wavSize = (u32)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (loadCache(name, wavSize)) { fclose(f); return NULL; }   // ya convertido antes
+
+    u8 h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
+        fclose(f); return "no es un WAV";
+    }
+
+    u16 fmt = 0, ch = 0, bits = 0;
+    u32 rate = 0, dataLen = 0;
+    bool haveFmt = false, haveData = false;
+    u8 c[8];
+    while (fread(c, 1, 8, f) == 8) {
+        u32 sz = rd32(c + 4);
+        if (!memcmp(c, "fmt ", 4)) {
+            u8 b[16];
+            if (sz < 16 || fread(b, 1, 16, f) != 16) { fclose(f); return "fmt invalido"; }
+            fmt = rd16(b); ch = rd16(b + 2); rate = rd32(b + 4); bits = rd16(b + 14);
+            haveFmt = true;
+            fseek(f, (long)(sz - 16 + (sz & 1)), SEEK_CUR);
+        } else if (!memcmp(c, "data", 4)) {
+            dataLen = sz; haveData = true; break;
+        } else {
+            fseek(f, (long)(sz + (sz & 1)), SEEK_CUR);
+        }
+    }
+    if (!haveFmt || !haveData) { fclose(f); return "WAV incompleto"; }
+    if ((fmt != 1 && fmt != 0xFFFE) || (ch != 1 && ch != 2) ||
+        (bits != 8 && bits != 16 && bits != 24) || rate == 0) {
+        fclose(f); return "solo PCM 8/16/24 mono/estereo";
+    }
+
+    long pos = ftell(f);
+    fseek(f, 0, SEEK_END);
+    long end = ftell(f);
+    fseek(f, pos, SEEK_SET);
+    if ((long)dataLen > end - pos) dataLen = (u32)(end - pos);   // WAV en streaming o truncado
+
+    u32 blockAlign = (u32)ch * (bits / 8);
+    u32 frames = dataLen / blockAlign;
+    if (frames > (u32)MAX_SECS * rate) frames = (u32)MAX_SECS * rate;   // max 2 min
+    if (frames < 256) { fclose(f); return "archivo muy corto"; }
+
+    // liberamos el sample anterior antes de pedir RAM; si falla volvemos al demo
+    resetSrc();
+
+    u32 budget = BUDGET, storeRate, outLen;
+    s8 *buf = NULL;
+    while (1) {
+        storeRate = rate;
+        if (storeRate > 32728) storeRate = 32728;
+        if ((u64)frames * storeRate / rate > budget)
+            storeRate = (u32)((u64)budget * rate / frames);
+        if (storeRate < 4000) storeRate = 4000;
+        outLen = (u32)((u64)frames * storeRate / rate);
+        buf = (s8 *)malloc(outLen);
+        if (buf) break;
+        budget = budget * 3 / 4;
+        if (budget < 200000) { fclose(f); return "sin memoria"; }
+    }
+
+    u8 *blk = (u8 *)malloc(4096);
+    if (!blk) { free(buf); fclose(f); return "sin memoria"; }
+    u32 perBlk = 4096 / blockAlign;
+
+    u32 j = 0, done = 0, phase = 0, cnt = 0, nb = 0;
+    s32 acc = 0;
+    int pk = 0;                                             // pico del sample (para normalizar)
+    while (done < frames) {
+        u32 n = frames - done;
+        if (n > perBlk) n = perBlk;
+        if (fread(blk, blockAlign, n, f) != n) break;
+        for (u32 k = 0; k < n; k++) {
+            const u8 *p = blk + k * blockAlign;
+            s32 m;
+            if (bits == 16) {
+                m = (s16)rd16(p);
+                if (ch == 2) m = (m + (s16)rd16(p + 2)) >> 1;
+            } else if (bits == 8) {
+                m = ((s32)p[0] - 128) * 256;
+                if (ch == 2) m = (m + ((s32)p[1] - 128) * 256) >> 1;
+            } else {
+                m = (s16)rd16(p + 1);                       // 24 bit: nos quedamos con los 16 altos
+                if (ch == 2) m = (m + (s16)rd16(p + 4)) >> 1;
+            }
+            acc += m; cnt++;
+            phase += storeRate;
+            if (phase >= rate) {                            // decimacion con promedio (anti-alias basico)
+                phase -= rate;
+                if (j < outLen) {
+                    s8 v = (s8)((acc / (s32)cnt) >> 8);
+                    int av = v < 0 ? -v : v;
+                    if (av > pk) pk = av;
+                    buf[j++] = v;
+                }
+                acc = 0; cnt = 0;
+            }
+        }
+        done += n;
+        audioTick();
+        if ((++nb & 31) == 0) drawLoadBar((int)(done / (frames / 100 + 1)));
+    }
+    free(blk);
+    fclose(f);
+
+    if (j < 256) { free(buf); return "error leyendo la SD"; }
+
+    if (pk > 0 && pk < 110) {                               // normaliza: sube samples bajitos hasta ~127
+        s32 mul = (127 << 8) / pk;
+        for (u32 i = 0; i < j; i++) {
+            s32 v = ((s32)buf[i] * mul) >> 8;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            buf[i] = (s8)v;
+        }
+    }
+
+    dk->heapBuf = buf; dk->src = buf; dk->srcLen = j; dk->srcRate = storeRate;
+    dk->lostSample = false;
+    strncpy(dk->curName, name, sizeof(dk->curName) - 1);
+    computeAuto();
+    updateInc();
+    resetTransport(false, false);                           // los tracks cargan en pausa, al inicio
+    computePeaks();
+
+    drawLoadBar(100);
+    drawLoadNote("guardando cache...");
+    saveCache(name, wavSize, buf, j, storeRate);
+    return NULL;
+}
+
+// ---------------------------------------------------------------- navegador
+#define MAX_ENT 128
+typedef struct { char name[128]; u8 dir; } Ent;
+static Ent ents[MAX_ENT];
+static int nEnt = 0, sel = 0, scrollTop = 0;
+
+static int entCmp(const void *a, const void *b) {
+    const Ent *x = (const Ent *)a, *y = (const Ent *)b;
+    if (x->dir != y->dir) return (int)y->dir - (int)x->dir;   // carpetas primero
+    return strcasecmp(x->name, y->name);
+}
+
+static void scanDir(void) {
+    nEnt = 0; sel = 0; scrollTop = 0;
+    DIR *d = opendir(".");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && nEnt < MAX_ENT) {
+        if (!strcmp(e->d_name, ".")) continue;
+        bool dir = (e->d_type == DT_DIR);
+        if (!dir) {
+            size_t n = strlen(e->d_name);
+            if (n < 5 || strcasecmp(e->d_name + n - 4, ".wav")) continue;
+        }
+        strncpy(ents[nEnt].name, e->d_name, sizeof(ents[nEnt].name) - 1);
+        ents[nEnt].name[sizeof(ents[nEnt].name) - 1] = 0;
+        ents[nEnt].dir = dir;
+        nEnt++;
+    }
+    closedir(d);
+    qsort(ents, nEnt, sizeof(Ent), entCmp);
+}
+
+#define BR_ROWS 14
+
+static void drawBrowser(void) {
+    clearScreen(fbTop, C_BG);
+    char cwd[256], t[40];
+    if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "?");
+    snprintf(t, sizeof t, "%.34s", cwd);
+    drawHeader("SD", t, C_ORG);
+    if (nEnt == 0) text(fbTop, 8, 24, "(sin .wav ni carpetas)", C_GRAY, 1);
+    for (int r = 0; r < BR_ROWS; r++) {
+        int i = scrollTop + r;
+        if (i >= nEnt) break;
+        int y = 21 + r * 11;
+        bool sl = (i == sel);
+        if (sl) rect(fbTop, 0, y, VW - 8, 11, C_YEL);
+        char n[40];
+        if (ents[i].dir) snprintf(n, sizeof n, "[%.34s]", ents[i].name);
+        else             snprintf(n, sizeof n, "%.36s", ents[i].name);
+        text(fbTop, 8, y + 1, n, sl ? C_DARK : (ents[i].dir ? C_ORG : C_LGRAY), 1);
+    }
+    if (nEnt > BR_ROWS) {                                    // barra de scroll
+        int full = BR_ROWS * 11;
+        int th = full * BR_ROWS / nEnt;
+        if (th < 6) th = 6;
+        int ty = 21 + (full - th) * scrollTop / (nEnt - BR_ROWS);
+        rect(fbTop, 250, 21, 3, full, C_PANEL2);
+        rect(fbTop, 250, ty, 3, th, C_ORG);
+    }
+    int x = 8;
+    keyHint(&x, 178, "A", "abrir");
+    keyHint(&x, 178, "B", "volver");
+}
+
+// abre el navegador de la SD (desde el menu o el boton de carpeta)
+static void openBrowser(void) {
+    if (!sdOK) return;
+    touching = false; touchDrag = false; freezeKey = false;
+    scanDir();
+    browsing = true;
+    drawBrowser();
+}
+
+// ---------------------------------------------------------------- parametros / texto
+enum { P_XF, P_SPEED, P_PITCH, P_SIZE, P_DENS, P_SPRAY, P_DRIFT, P_HARM, P_SHIM, P_JIT, P_REV, P_PAN,
+       P_REVERB, P_DECAY, P_DLY, P_DTIME, P_DFB, P_FILT, P_SWEEP, P_VOL, P_LOAD, P_COUNT };
+static const char *const pLabel[P_COUNT] = {
+    "XFADE", "VELOCID", "PITCH", "TAMANO", "DENSID", "SPRAY", "DERIVA", "ARMONIA", "SHIMMER", "JITTER", "REVERSA", "ESTEREO",
+    "REVERB", "COLA", "DELAY", "TIEMPO", "REPITE", "FILTRO", "BARRIDO", "VOLUMEN", "CARGAR"
+};
+static int cur = 0, pTop = 0;
+#define P_ROWS 7
+
+static s32 stepDly(s32 v) { return v < 200 ? 10 : (v < 500 ? 25 : 50); }
+static s32 stepSize(s32 v) { return v < 100 ? 10 : (v < 500 ? 50 : 100); }
+
+static void adjust(int d) {
+    switch (cur) {
+        case P_XF:    setXfade(xfade + d * 8);                        break;
+        case P_SPEED: dk->speedPct = clampi(dk->speedPct + d * 5, -200, 200); updateInc(); break;
+        case P_PITCH: dk->semis    = clampi(dk->semis + d, -24, 24);          updateInc(); break;
+        case P_SIZE:  sizeMs   = clampi(sizeMs + d * stepSize(d > 0 ? sizeMs : sizeMs - 1), 10, 2000); updateInc(); break;
+        case P_DENS:  density  = clampi(density + d * ((d > 0 ? density : density - 1) < 10 ? 1 : 2), 1, 100); updateInc(); break;
+        case P_SPRAY: sprayMs  = clampi(sprayMs + d * 10, 0, 500);    break;
+        case P_DRIFT: driftPct = clampi(driftPct + d * 5, 0, 100);    if (!driftPct) dk->driftW = 0; break;
+        case P_HARM:  harmPct  = clampi(harmPct + d * 5, 0, 100);     break;
+        case P_SHIM:  shimPct  = clampi(shimPct + d * 5, 0, 100);     break;
+        case P_PAN:   panPct   = clampi(panPct + d * 5, 0, 100);      break;
+        case P_DLY:   delayPct = clampi(delayPct + d * 5, 0, 100);    updateDelay(); break;
+        case P_DTIME: delayMs  = clampi(delayMs + d * stepDly(d > 0 ? delayMs : delayMs - 1), 50, 1000); updateDelay(); break;
+        case P_DFB:   delayFbPct = clampi(delayFbPct + d * 5, 0, 95); updateDelay(); break;
+        case P_FILT:  filtPct  = clampi(filtPct + d * 4, 0, 100);     break;
+        case P_SWEEP: sweepPct = clampi(sweepPct + d * 5, 0, 100);    break;
+        case P_JIT:   jitterC  = clampi(jitterC + d * 5, 0, 100);     break;
+        case P_REV:   revPct   = clampi(revPct + d * 10, 0, 100);     break;
+        case P_REVERB: revMixPct = clampi(revMixPct + d * 5, 0, 100); updateReverb(); break;
+        case P_DECAY: decayPct = clampi(decayPct + d * 5, 0, 100);    updateReverb(); break;
+        case P_VOL:   gain     = clampi(gain + d * 4, 4, 128);        updateInc(); break;
+        case P_LOAD:  if (d > 0) openBrowser();                       break;
+        default: break;
+    }
+}
+
+static void valStr(int i, char *b, size_t n) {
+    s32 tg = (gain * 2) / 5;
+    switch (i) {
+        case P_XF:    snprintf(b, n, "A %ld%% B", (long)(xfade * 100 / 256)); break;
+        case P_SPEED: snprintf(b, n, "%c %+ld%%", 'A' + actDeck, (long)dk->speedPct); break;
+        case P_PITCH: snprintf(b, n, "%c %+ld st", 'A' + actDeck, (long)dk->semis); break;
+        case P_SIZE:  snprintf(b, n, "%ld ms", (long)sizeMs); break;
+        case P_DENS:  snprintf(b, n, "%ld /s", (long)density); break;
+        case P_SPRAY: snprintf(b, n, "%ld ms", (long)sprayMs); break;
+        case P_DRIFT: snprintf(b, n, "%ld%%", (long)driftPct); break;
+        case P_HARM:  snprintf(b, n, "%ld%%", (long)harmPct); break;
+        case P_SHIM:  snprintf(b, n, "%ld%%", (long)shimPct); break;
+        case P_PAN:   snprintf(b, n, "%ld%%", (long)panPct); break;
+        case P_DLY:   snprintf(b, n, "%ld%%", (long)delayPct); break;
+        case P_DTIME: snprintf(b, n, "%ld ms", (long)delayMs); break;
+        case P_DFB:   snprintf(b, n, "%ld%%", (long)delayFbPct); break;
+        case P_FILT:
+            if (filtPct >= 100) snprintf(b, n, "abierto");
+            else                snprintf(b, n, "%ld Hz", (long)fcHz[filtPct * 127 / 100]);
+            break;
+        case P_SWEEP:
+            if (sweepPct) snprintf(b, n, "%ld%%", (long)sweepPct);
+            else          snprintf(b, n, "off");
+            break;
+        case P_JIT:   snprintf(b, n, "%ld cent", (long)jitterC); break;
+        case P_REV:   snprintf(b, n, "%ld%%", (long)revPct); break;
+        case P_REVERB: snprintf(b, n, "%ld%%", (long)revMixPct); break;
+        case P_DECAY: snprintf(b, n, "%ld%%", (long)decayPct); break;
+        case P_VOL:   snprintf(b, n, "%ld.%ld x", (long)(tg / 16), (long)((tg % 16) * 10 / 16)); break;
+        case P_LOAD:  snprintf(b, n, "%s", sdOK ? (actDeck ? "WAV -> B >" : "WAV -> A >") : "sin SD"); break;
+        default:      b[0] = 0; break;
+    }
+}
+
+static void fmtT(char *b, size_t n, u32 tenths) {
+    snprintf(b, n, "%lu:%02lu.%lu", (unsigned long)(tenths / 600),
+             (unsigned long)((tenths / 10) % 60), (unsigned long)(tenths % 10));
+}
+
+// 0..256 para la barra de cada parametro (-1 = sin barra)
+static s32 paramFrac(int i) {
+    switch (i) {
+        case P_XF:     return xfade;
+        case P_SPEED:  return (dk->speedPct + 200) * 256 / 400;
+        case P_PITCH:  return (dk->semis + 24) * 256 / 48;
+        case P_SIZE:   return isqrt32((u32)sizeMs * 65536u / 2000u);
+        case P_DENS:   return density * 256 / 100;
+        case P_SPRAY:  return sprayMs * 256 / 500;
+        case P_DRIFT:  return driftPct * 256 / 100;
+        case P_HARM:   return harmPct * 256 / 100;
+        case P_SHIM:   return shimPct * 256 / 100;
+        case P_PAN:    return panPct * 256 / 100;
+        case P_DLY:    return delayPct * 256 / 100;
+        case P_DTIME:  return (delayMs - 50) * 256 / 950;
+        case P_DFB:    return delayFbPct * 256 / 95;
+        case P_FILT:   return filtPct * 256 / 100;
+        case P_SWEEP:  return sweepPct * 256 / 100;
+        case P_JIT:    return jitterC * 256 / 100;
+        case P_REV:    return revPct * 256 / 100;
+        case P_REVERB: return revMixPct * 256 / 100;
+        case P_DECAY:  return decayPct * 256 / 100;
+        case P_VOL:    return gain * 256 / 128;
+        default:       return -1;
+    }
+}
+
+#define PR_Y0  78
+#define PR_H   11
+
+static char sigCache[16][128];
+static bool topFull = true;
+
+// true si lo que va en ese bloque cambio desde la ultima vez (asi solo se redibuja lo necesario)
+static bool sigChanged(int slot, const char *sig) {
+    if (!topFull && !strcmp(sigCache[slot], sig)) return false;
+    strncpy(sigCache[slot], sig, sizeof(sigCache[slot]) - 1);
+    sigCache[slot][sizeof(sigCache[slot]) - 1] = 0;
+    return true;
+}
+
+static void drawParamRow(int r, int i, const char *v, int up, int dn) {
+    int y = PR_Y0 + r * PR_H;
+    bool sl = (i == cur);
+    rect(fbTop, 0, y, VW, PR_H, sl ? C_YEL : C_BG);
+    text(fbTop, 8, y + 1, pLabel[i], sl ? C_DARK : C_LGRAY, 1);
+    s32 f = paramFrac(i);
+    if (f >= 0) {
+        int bx = 66, bw = 84;
+        u16 fc = sl ? C_ORG : C_GRAY;
+        int fw = (int)f * bw / 256;
+        rect(fbTop, bx, y + 3, bw, 5, sl ? C_YELD : C_PANEL2);
+        if (i == P_SPEED || i == P_PITCH || i == P_XF) {     // barras bipolares: parten del centro
+            int cx = bx + bw / 2;
+            if (fw >= bw / 2) rect(fbTop, cx, y + 3, fw - bw / 2, 5, fc);
+            else              rect(fbTop, bx + fw, y + 3, bw / 2 - fw, 5, fc);
+            rect(fbTop, cx, y + 2, 1, 7, sl ? C_DARK : C_LGRAY);
+        } else {
+            rect(fbTop, bx, y + 3, fw, 5, fc);
+        }
+    }
+    text(fbTop, 240 - textW(v, 1), y + 1, v, sl ? C_DARK : C_WHITE, 1);
+    if (up) text(fbTop, 246, y + 1, "^", C_ORG, 1);
+    if (dn) text(fbTop, 246, y + 1, "v", C_ORG, 1);
+}
+
+// ---- dibujo de cinta: lineas, discos, carretes
+static s32 sinT[64];                                   // Q8
+static void putpx(u16 *s, int x, int y, u16 c) { if ((unsigned)x < VW && (unsigned)y < VH) s[y * VW + x] = c; }
+
+static void line(u16 *s, int x0, int y0, int x1, int y1, u16 c) {
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (int n = 0; n < 200; n++) {
+        putpx(s, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void disc(u16 *s, int cx, int cy, int r, u16 c) {
+    for (int dy = -r; dy <= r; dy++) {
+        int w = isqrt32((u32)(r * r - dy * dy) + (u32)r / 2);
+        rect(s, cx - w, cy + dy, 2 * w + 1, 1, c);
+    }
+}
+
+static void ringO(u16 *s, int cx, int cy, int r, u16 c) {
+    for (int dy = -r; dy <= r; dy++) {
+        int w = isqrt32((u32)(r * r - dy * dy) + (u32)r / 2);
+        putpx(s, cx - w, cy + dy, c); putpx(s, cx + w, cy + dy, c);
+        if (dy == -r || dy == r) rect(s, cx - w, cy + dy, 2 * w + 1, 1, c);
+    }
+}
+
+// un carrete: paquete de cinta (radio rp), pestanas, nucleo y 3 radios que giran
+static void drawReel(int cx, int cy, int rp, int ang64, u16 hub) {
+    disc(fbTop, cx, cy, rp, C_YELD);
+    ringO(fbTop, cx, cy, 15, C_LGRAY);
+    ringO(fbTop, cx, cy, rp, C_ORGD);
+    for (int k = 0; k < 3; k++) {
+        int a = (ang64 + k * 21 + (k + 1) / 2) & 63;               // 0, 21, 43 ~ tercios de 64
+        int ca = sinT[(a + 16) & 63], sa = sinT[a];
+        line(fbTop, cx + (ca * 4 >> 8), cy + (sa * 4 >> 8), cx + (ca * 14 >> 8), cy + (sa * 14 >> 8), C_DARK);
+        line(fbTop, cx + (ca * 4 >> 8) + 1, cy + (sa * 4 >> 8), cx + (ca * 14 >> 8) + 1, cy + (sa * 14 >> 8), C_LGRAY);
+    }
+    disc(fbTop, cx, cy, 4, hub);
+    disc(fbTop, cx, cy, 1, C_DARK);
+}
+
+#define RZ_Y   27          // zona de carretes (se redibuja cada cuadro)
+#define RZ_H   33
+
+static s32 heardPosD(Deck *d, u32 ahead);
+
+static void drawDeckPanel(int di, s32 heard, bool statics) {
+    Deck *d = &decks[di];
+    int px = di ? 129 : 1;
+    bool act = (di == actDeck);
+    if (statics) {
+        rect(fbTop, px, 15, 126, 60, C_PANEL);
+        rect(fbTop, px, 15, 126, 1, act ? C_ORG : C_LINE);
+        rect(fbTop, px, 74, 126, 1, act ? C_ORG : C_LINE);
+        rect(fbTop, px, 15, 1, 60, act ? C_ORG : C_LINE);
+        rect(fbTop, px + 125, 15, 1, 60, act ? C_ORG : C_LINE);
+        pill(fbTop, px + 4, 18, 13, 9, act ? C_ORG : C_PANEL2);
+        text(fbTop, px + 7, 18, di ? "B" : "A", act ? C_DARK : C_LGRAY, 1);
+        char nm[24];
+        snprintf(nm, sizeof nm, "%.17s", d->curName);
+        text(fbTop, px + 20, 18, nm, act ? C_WHITE : C_LGRAY, 1);
+    }
+    // carretes y camino de la cinta
+    rect(fbTop, px + 2, RZ_Y, 122, RZ_H, C_PANEL);
+    u32 len = d->srcLen ? d->srcLen : 1;
+    s32 pos = d->dropOn ? d->trackI : d->posI;
+    s32 fr = (s32)((u32)pos * 256 / len);                       // 0..255
+    int rl = 6 + (255 - fr) * 8 / 255, rr = 6 + fr * 8 / 255;
+    int cxl = px + 30, cxr = px + 96, cy = RZ_Y + 16;
+    int ang = (int)((u32)d->reel >> 10) & 63;
+    line(fbTop, cxl, cy + rl, px + 46, RZ_Y + 29, C_YELD);
+    line(fbTop, px + 46, RZ_Y + 29, px + 80, RZ_Y + 29, C_YELD);
+    line(fbTop, px + 80, RZ_Y + 29, cxr, cy + rr, C_YELD);
+    drawReel(cxl, cy, rl, ang, C_GRAY);
+    drawReel(cxr, cy, rr, (ang + 9) & 63, C_GRAY);
+    rect(fbTop, px + 54, RZ_Y + 29, 18, 4, d->playing ? C_ORG : C_GRAY);     // cabezal
+    rect(fbTop, px + 46 - 1, RZ_Y + 27, 3, 4, C_LGRAY);                       // guias
+    rect(fbTop, px + 80 - 1, RZ_Y + 27, 3, 4, C_LGRAY);
+
+    // contador + estado
+    char sig[64], a[20], b[20];
+    u32 now10 = (u32)heard * 10 / d->srcRate, len10 = d->srcLen * 10 / d->srcRate;
+    fmtT(a, sizeof a, now10); fmtT(b, sizeof b, len10);
+    int stt = (act && loopEdit) ? 1 : 0;
+    snprintf(sig, sizeof sig, "%s|%s|%d|%d|%d|%d", a, b, d->loopStart * 100 / (s32)d->srcLen + d->loopEnd * 1000 / (s32)d->srcLen, stt, d->playing, act);
+    if (sigChanged(1 + di, sig)) {
+        rect(fbTop, px + 1, 62, 124, 11, C_PANEL);
+        text(fbTop, px + 4, 63, a, C_YEL, 1);
+        char t2[24];
+        snprintf(t2, sizeof t2, "/%s", b);
+        text(fbTop, px + 4 + textW(a, 1), 63, t2, C_GRAY, 1);
+        int x = px + 121;
+        if (stt)         { x -= textW("EDIT", 1); text(fbTop, x, 63, "EDIT", C_WHITE, 1); x -= 5; }
+        if (!stt && (d->loopStart > 0 || d->loopEnd < (s32)d->srcLen - 1)) { x -= textW("LOOP", 1); text(fbTop, x, 63, "LOOP", C_YEL, 1); x -= 5; }
+        if (!d->playing) { x -= textW("||", 1);   text(fbTop, x, 63, "||", C_ORG, 1); }
+    }
+}
+
+static void drawMain(u32 lead) {
+    if (topFull) clearScreen(fbTop, C_BG);
+    char sig[128], v[24];
+
+    snprintf(sig, sizeof sig, "%d|%d|%d", actDeck, (int)sdOK, (int)xfade);
+    if (sigChanged(0, sig)) {
+        rect(fbTop, 0, 0, VW, 14, C_PANEL);
+        rect(fbTop, 0, 0, 4, 14, C_ORG);
+        text(fbTop, 10, 2, "EFEES", C_WHITE, 1);
+        text(fbTop, 46, 2, "reel to reel", C_ORG, 1);
+        if (!sdOK) text(fbTop, 112, 2, "sin SD", C_GRAY, 1);
+        char x[16];
+        snprintf(x, sizeof x, "A %ld%% B", (long)(xfade * 100 / 256));
+        text(fbTop, VW - 6 - textW(x, 1), 2, x, C_YEL, 1);
+    }
+
+    for (int di = 0; di < 2; di++) {
+        bool st = topFull;
+        snprintf(sig, sizeof sig, "%d|%d|%.100s", di == actDeck, di, decks[di].curName);
+        if (sigChanged(11 + di, sig)) st = true;
+        drawDeckPanel(di, heardPosD(&decks[di], lead), st);
+    }
+    // nivel de cada deck segun el crossfader
+    {
+        snprintf(sig, sizeof sig, "%d", (int)xfade);
+        if (sigChanged(13, sig)) {
+            rect(fbTop, 1, 75, 126, 2, C_BG);  rect(fbTop, 129, 75, 126, 2, C_BG);
+            rect(fbTop, 1, 75, 126 * xfGainA / 256, 2, C_ORG);
+            rect(fbTop, 129, 75, 126 * xfGainB / 256, 2, C_ORG);
+        }
+    }
+
+    // parametros (con scroll)
+    if (cur < pTop) pTop = cur;
+    if (cur >= pTop + P_ROWS) pTop = cur - P_ROWS + 1;
+    for (int r = 0; r < P_ROWS; r++) {
+        int i = pTop + r;
+        char sg[96];
+        if (i >= P_COUNT) {
+            if (sigChanged(4 + r, "-")) rect(fbTop, 0, PR_Y0 + r * PR_H, VW, PR_H, C_BG);
+            continue;
+        }
+        valStr(i, v, sizeof v);
+        int up = (r == 0 && pTop > 0), dn = (r == P_ROWS - 1 && pTop + P_ROWS < P_COUNT);
+        snprintf(sg, sizeof sg, "%d|%d|%s|%d|%d|%d", i, (int)(i == cur), v, (int)paramFrac(i), up, dn);
+        if (sigChanged(4 + r, sg)) drawParamRow(r, i, v, up, dn);
+    }
+
+    // ayuda (fija)
+    if (topFull) {
+        rect(fbTop, 8, 158, 240, 1, C_PANEL2);
+        int x = 8;
+        keyHint(&x, 162, "START", "play");
+        keyHint(&x, 162, "B", "freeze");
+        x = 8;
+        keyHint(&x, 173, "SELECT", "A/B");
+        keyHint(&x, 173, "L/R", "crossfade");
+        x = 8;
+        keyHint(&x, 184, "Y", "loop=todo");
+    }
+    topFull = false;
+}
+
+// ---------------------------------------------------------------- vista (pantalla tactil)
+// Cada deck es una columna vertical: el tiempo corre de arriba hacia abajo y la cabeza es una
+// linea horizontal (como la cinta pasando por el cabezal).
+#define TOPY    12                   // filas reservadas arriba para la etiqueta del deck
+#define PH      118                  // filas de la onda (tiempo)
+#define WAVE_H  (TOPY + PH)          // 130
+#define XF_Y    132                  // crossfader
+#define BAR_Y   156
+#define COLW    50                   // medio ancho de cada columna
+#define AMPX    46
+static const int colX[2] = { 58, 198 };
+
+#define C_SPRAY    RGB8( 46,  46,  52)
+#define C_LOOPBG   RGB8( 58,  40,  50)
+#define C_LOOPSPR  RGB8( 74,  50,  64)
+#define C_AXIS     RGB8( 52,  52,  58)
+
+typedef struct { int cy, spr, gh, ls, le; bool lon, drop; } View;
+static View lastV[2];
+static bool lastPlaying = false, lastLoopOn = false, lastDrop = false;
+static int lastAct = -1;
+static s32 lastXf = -1;
+
+static void computePeaks(void) {
+    for (int r = 0; r < PH; r++) {
+        u32 i0 = dk->srcLen * (u32)r / PH;
+        u32 i1 = dk->srcLen * (u32)(r + 1) / PH;
+        if (i1 <= i0) i1 = i0 + 1;
+        u32 step = (i1 - i0) / 64;                   // maximo ~64 puntos por fila
+        if (step < 1) step = 1;
+        int mn = 127, mx = -127;
+        for (u32 i = i0; i < i1 && i < dk->srcLen; i += step) {
+            int v = dk->src[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        if (mn > mx) mn = mx = 0;
+        dk->pkA[r] = (u8)(64 + mn * AMPX / 127);
+        dk->pkB[r] = (u8)(64 + mx * AMPX / 127);
+    }
+    fullRedraw = true;
+}
+
+static View viewOf(Deck *d, s32 heardI) {
+    View v;
+    u32 len = d->srcLen;
+    v.cy = (int)((u32)heardI * PH / len);
+    if (v.cy > PH - 1) v.cy = PH - 1;
+    v.spr = (int)((u32)(sprayMs * d->srcRate / 1000) * PH / len);
+    v.gh  = (int)((u32)(sizeMs * d->srcRate / 1000) * PH / len);
+    if (v.gh < 1) v.gh = 1;
+    v.ls  = (int)((u32)d->loopStart * PH / len);
+    v.le  = (int)((u32)d->loopEnd * PH / len);
+    v.lon = d->loopStart > 0 || d->loopEnd < (s32)d->srcLen - 1;   // tinte solo si el loop no es todo el track
+    v.drop = d->dropOn;
+    return v;
+}
+
+static void drawRow(int di, int r, const View *v) {
+    Deck *d = &decks[di];
+    int cx = colX[di], x0 = cx - COLW, y = TOPY + r;
+    if (r == v->cy) { rect(fb, x0, y, 2 * COLW + 1, 1, v->drop ? C_WHITE : C_ORG); return; }
+    bool inLoop  = v->lon && r >= v->ls && r <= v->le;
+    bool inSpray = r >= v->cy - v->spr && r <= v->cy + v->spr;
+    u16 bg = inLoop ? (inSpray ? C_LOOPSPR : C_LOOPBG) : (inSpray ? C_SPRAY : C_BG);
+    if (v->lon && (r == v->ls || r == v->le)) bg = C_YEL;
+    // gris = por tocar, amarillo claro = ya sonado, blanco = ancho de un grano
+    u16 wv = (r >= v->cy && r < v->cy + v->gh) ? C_WHITE : (r < v->cy ? C_YEL : C_GRAY);
+    rect(fb, x0, y, 2 * COLW + 1, 1, bg);
+    putpx(fb, cx, y, C_AXIS);
+    int a = d->pkA[r] - 64, b = d->pkB[r] - 64;
+    rect(fb, cx + a, y, b - a + 1, 1, wv);
+}
+
+static void drawRows(int di, int r0, int r1, const View *v) {
+    if (r0 < 0) r0 = 0;
+    if (r1 > PH - 1) r1 = PH - 1;
+    for (int r = r0; r <= r1; r++) drawRow(di, r, v);
+}
+
+static void drawTags(void) {                                // etiquetas A / B arriba de cada columna
+    for (int di = 0; di < 2; di++) {
+        bool act = (di == actDeck);
+        int x = colX[di] - COLW;
+        rect(fb, x, 0, 2 * COLW + 1, TOPY - 1, C_BG);
+        pill(fb, x, 1, 15, 10, act ? C_ORG : C_PANEL2);
+        text(fb, x + 4, 1, di ? "B" : "A", act ? C_DARK : C_LGRAY, 1);
+        char nm[16];
+        snprintf(nm, sizeof nm, "%.13s", decks[di].curName);
+        text(fb, x + 19, 1, nm, act ? C_WHITE : C_GRAY, 1);
+    }
+}
+
+static void drawGrains(void) {                              // marcas de granos al lado de cada columna
+    for (int di = 0; di < 2; di++) {
+        Deck *d = &decks[di];
+        int tx = di ? colX[di] - COLW - 7 : colX[di] + COLW + 3;
+        rect(fb, tx, TOPY, 4, PH, C_BG);
+        for (int g = 0; g < MAX_GRAINS; g++) {
+            if (!d->grains[g].on || d->grains[g].ipos >= d->srcLen) continue;
+            int gy = (int)(d->grains[g].ipos * PH / d->srcLen);
+            rect(fb, tx, TOPY + gy, 4, 1, C_YEL);
+        }
+    }
+}
+
+static void drawXfade(void) {
+    rect(fb, 0, WAVE_H, VW, BAR_Y - WAVE_H, C_PANEL);
+    rect(fb, 0, WAVE_H, VW, 1, C_LINE);
+    text(fb, 6, XF_Y + 6, "A", xfade < 128 ? C_YEL : C_GRAY, 1);
+    text(fb, 244, XF_Y + 6, "B", xfade >= 128 ? C_YEL : C_GRAY, 1);
+    rect(fb, 20, XF_Y + 10, 216, 3, C_PANEL2);
+    for (int k = 0; k <= 4; k++) rect(fb, 20 + k * 54, XF_Y + 6, 1, 11, C_LINE);
+    int kx = 20 + xfade * 216 / 256;
+    rect(fb, kx - 5, XF_Y + 3, 11, 17, C_ORG);
+    rect(fb, kx, XF_Y + 3, 1, 17, C_DARK);
+    lastXf = xfade;
+}
+
+// triangulo relleno apuntando a la derecha (dir=+1) o a la izquierda (dir=-1), 14 filas
+static void fillTri(int x, int y, int dir, u16 c) {
+    for (int r = 0; r < 14; r++) {
+        int w = (r < 7 ? r + 1 : 14 - r) * 2;
+        if (dir > 0) rect(fb, x, y + r, w, 1, c);
+        else         rect(fb, x - w, y + r, w, 1, c);
+    }
+}
+
+#define BTN_Y  159
+#define BTN_H  30
+#define BTN_W  46
+
+static void btnFrame(int x, u16 bg) { pill(fb, x, BTN_Y, BTN_W, BTN_H, bg); }
+static void btnLabel(int x, const char *t, u16 c) { text(fb, x + (BTN_W - textW(t, 1)) / 2, 177, t, c, 1); }
+
+// 5 botones de 46 px, paso 50: x = 4, 54, 104, 154, 204. Cortes del toque en main: 52, 102, 152, 202.
+// Todos actuan sobre el deck activo.
+static void drawButtons(void) {
+    rect(fb, 0, BAR_Y, VW, VH - BAR_Y, C_PANEL);
+    int x, cx, iy = 162;
+    u16 fg;
+
+    // [play / pausa]
+    x = 4; cx = x + 23;
+    fg = dk->playing ? C_DARK : C_LGRAY;
+    btnFrame(x, dk->playing ? C_ORG : C_PANEL2);
+    if (dk->playing) { rect(fb, cx - 8, iy, 5, 14, fg); rect(fb, cx + 3, iy, 5, 14, fg); }
+    else             { fillTri(cx - 6, iy, +1, fg); }
+    btnLabel(x, dk->playing ? "PAUSA" : "PLAY", fg);
+
+    // [loop]: corchetes
+    x = 54; cx = x + 23;
+    fg = loopEdit ? C_DARK : C_LGRAY;
+    btnFrame(x, loopEdit ? C_YEL : C_PANEL2);
+    rect(fb, cx - 14, iy, 3, 14, fg); rect(fb, cx - 14, iy, 6, 3, fg); rect(fb, cx - 14, iy + 11, 6, 3, fg);
+    rect(fb, cx + 11, iy, 3, 14, fg); rect(fb, cx + 8, iy, 6, 3, fg);  rect(fb, cx + 8, iy + 11, 6, 3, fg);
+    rect(fb, cx - 3, iy + 5, 6, 4, fg);
+    btnLabel(x, loopEdit ? "EDITAR" : "LOOP", fg);
+
+    // [al inicio]: barra + triangulo a la izquierda
+    x = 104; cx = x + 23;
+    fg = C_LGRAY;
+    btnFrame(x, C_PANEL2);
+    rect(fb, cx - 12, iy, 3, 14, fg);
+    fillTri(cx + 8, iy, -1, fg);
+    btnLabel(x, "INICIO", fg);
+
+    // [carpeta]: carga un WAV en el deck activo
+    x = 154; cx = x + 23;
+    fg = C_LGRAY;
+    btnFrame(x, C_PANEL2);
+    rect(fb, cx - 12, iy + 1, 9, 3, fg);
+    rect(fb, cx - 12, iy + 4, 24, 10, fg);
+    btnLabel(x, actDeck ? "SD > B" : "SD > A", fg);
+
+    // [TODO]: loop = track completo (marco)
+    x = 204; cx = x + 23;
+    fg = C_LGRAY;
+    btnFrame(x, C_PANEL2);
+    rect(fb, cx - 12, iy, 24, 14, fg);
+    rect(fb, cx - 9, iy + 3, 18, 8, C_PANEL2);
+    btnLabel(x, "TODO", fg);
+
+    lastPlaying = dk->playing;
+    lastLoopOn = loopEdit;
+    lastDrop = false;
+    lastAct = actDeck;
+}
+
+static void updateView(u32 lead) {
+    View v[2];
+    for (int di = 0; di < 2; di++) v[di] = viewOf(&decks[di], heardPosD(&decks[di], lead));
+    if (fullRedraw) {
+        clearScreen(fb, C_BG);
+        for (int di = 0; di < 2; di++) drawRows(di, 0, PH - 1, &v[di]);
+        drawTags(); drawXfade(); drawButtons();
+        fullRedraw = false;
+    } else {
+        for (int di = 0; di < 2; di++) {
+            const View *o = &lastV[di], *n = &v[di];
+            bool loopCh = (n->lon != o->lon) || (n->lon && (n->ls != o->ls || n->le != o->le));
+            if (loopCh) {
+                drawRows(di, 0, PH - 1, n);
+            } else if (n->cy != o->cy || n->spr != o->spr || n->gh != o->gh || n->drop != o->drop) {
+                int e0 = o->gh > o->spr ? o->gh : o->spr, e1 = n->gh > n->spr ? n->gh : n->spr;
+                int a0 = o->cy - o->spr, b0 = o->cy + e0, a1 = n->cy - n->spr, b1 = n->cy + e1;
+                drawRows(di, a0 < a1 ? a0 : a1, b0 > b1 ? b0 : b1, n);   // solo lo que cambio
+            }
+        }
+        if (actDeck != lastAct) drawTags();
+        if (xfade != lastXf) drawXfade();
+        if (dk->playing != lastPlaying || loopEdit != lastLoopOn || actDeck != lastAct) drawButtons();
+    }
+    lastV[0] = v[0]; lastV[1] = v[1];
+    drawGrains();
+}
+
+// donde esta la cabeza segun lo que SE ESCUCHA (el audio se renderiza ~47 ms por delante)
+static s32 heardPosD(Deck *d, u32 ahead) {
+    s32 h;
+    if (d->dropOn || d->mixQ > MIX_FULL / 2) {              // se oye sobre todo el track limpio
+        h = d->trackI;
+        if (d->playing) h -= (s32)(((u32)ahead * d->cleanInc) >> 16);
+    } else {
+        h = d->posI;
+        if (d->playing && !(touching && d == dk) && !(freezeKey && d == dk)) h -= (s32)(((s32)ahead * d->scanInc) >> 16);
+    }
+    return clampi(h, 0, (s32)d->srcLen - 1);
+}
+
+// ---------------------------------------------------------------- anillo de audio
+// El indice de escritura siempre queda alineado a CHUNK (si no, el ultimo bloque de cada vuelta
+// se sale del buffer y deja un hueco con audio viejo).
+static inline u32 ringSync(u32 ph) { return (ph + LEAD) & ~(u32)(CHUNK - 1) & (OUT_LEN - 1); }
+
+// adelanto de escritura sobre el playhead, en ticks del timer (16 por muestra) y con signo:
+// al contar los ticks que pasaron entre cuadros, un tiron largo se detecta (leadT < 0) aunque
+// el indice del anillo ya haya dado la vuelta
+static s32 leadT = LEAD * 16;
+static s32 leadGoal = LEAD * 16;      // durante una carga sube a ~100 ms para aguantar las lecturas lentas de la SD
+static u32 tPrev = 0, ringResyncs = 0;
+
+static void ringReset(u32 *wr, u32 t) {
+    u32 ph = (t >> 4) & (OUT_LEN - 1);
+    *wr = ringSync(ph);
+    leadT = (s32)(((*wr - ph) & (OUT_LEN - 1)) * 16);
+    tPrev = t;
+    ringResyncs++;
+}
+
+// renderiza por delante del playhead; si el playhead nos alcanzo (hubo un tiron) resincroniza
+static u32 pump(u32 wr, u32 t) {
+    leadT -= (s32)((t - tPrev) & 0xFFFF);
+    tPrev = t;
+    if (leadT < 0) ringReset(&wr, t);
+    while (leadT < leadGoal) {
+        render(&outL[wr], &outR[wr], CHUNK);
+        DC_FlushRange(&outL[wr], CHUNK * 2);
+        DC_FlushRange(&outR[wr], CHUNK * 2);
+        wr = (wr + CHUNK) & (OUT_LEN - 1);
+        leadT += CHUNK * 16;
+    }
+    return wr;
+}
+
+static u32 ringWr = LEAD;
+static void audioTick(void) { ringWr = pump(ringWr, TIMER_DATA(0)); }
+
+// ---------------------------------------------------------------- main
+int main(void) {
+    // las dos pantallas son bitmaps de 16 bit: arriba parametros, abajo forma de onda y botones
+    videoSetMode(MODE_5_2D | DISPLAY_BG3_ACTIVE);
+    videoSetModeSub(MODE_5_2D | DISPLAY_BG3_ACTIVE);
+    vramSetBankA(VRAM_A_MAIN_BG);
+    vramSetBankC(VRAM_C_SUB_BG);
+    int bgMain = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
+    int bgSub  = bgInitSub(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
+    fbTop = (u16 *)bgGetGfxPtr(bgMain);
+    fb    = (u16 *)bgGetGfxPtr(bgSub);
+    clearScreen(fbTop, C_BG);
+    clearScreen(fb, C_BG);
+
+    sdOK = fatInitDefault();
+    soundEnable();
+
+    for (int i = 0; i < OUT_LEN; i++) outL[i] = outR[i] = 0;
+    // sample inicial: sierra ~220 Hz con decaimiento, para sonar antes de cargar nada
+    for (int i = 0; i < DEMO_LEN; i++)
+        demoBuf[i] = (s8)(((((i % 73) * 400 - 14600) * (DEMO_LEN - i)) / DEMO_LEN) >> 8);
+    for (int i = 0; i < WIN_LEN; i++)        // ventana Hann en Q15
+        win[i] = (s16)(32767.0f * 0.5f * (1.0f - cosf(6.2831853f * i / (WIN_LEN - 1))));
+    win[WIN_LEN] = 0;
+    harmRatio[0] = (s32)(65536.0f * exp2f(-12.0f / 12.0f));
+    harmRatio[1] = (s32)(65536.0f * exp2f(-5.0f / 12.0f));
+    harmRatio[2] = (s32)(65536.0f * exp2f(7.0f / 12.0f));
+    harmRatio[3] = (s32)(65536.0f * exp2f(12.0f / 12.0f));
+    initTables();
+    updateDelay();
+    dtCur = dtTgt;
+    updateReverb();
+    for (int i = 0; i < 2; i++) {                    // los dos decks arrancan con el demo; A suena, B espera
+        dk = &decks[i];
+        dk->speedPct = 100; dk->semis = 0;
+        dk->heapBuf = NULL;
+        useDemo("[demo]");
+        dk->playing = (i == 0);
+    }
+    dk = &decks[0];
+    setXfade(0);
+
+    DC_FlushRange(outL, sizeof(outL));
+    DC_FlushRange(outR, sizeof(outR));
+    // dos canales mono, uno a cada lado: eso da el estereo
+    soundPlaySample(outL, SoundFormat_16Bit, sizeof(outL), OUT_RATE, 127, 0, true, 0);
+    soundPlaySample(outR, SoundFormat_16Bit, sizeof(outR), OUT_RATE, 127, 127, true, 0);
+
+    // reloj del playhead: 33.514 MHz / 64 = 523656 Hz = 16 ticks por muestra de salida
+    TIMER_DATA(0) = 0;
+    TIMER_CR(0) = TIMER_ENABLE | TIMER_DIV_64;
+
+    u32 frame = 0;
+    tPrev = TIMER_DATA(0);
+    leadT = LEAD * 16;
+    ringWr = LEAD;
+    bool uiDirty = true;
+    int touchDeck = 0;
+    keysSetRepeat(15, 3);
+
+    while (1) {
+        swiWaitForVBlank();
+        scanKeys();
+        u32 kd = keysDown(), kh = keysHeld(), kr = keysDownRepeat();
+        if (kd | kr) uiDirty = true;
+
+        if (browsing) {
+            touching = false; freezeKey = false; touchDrag = false;
+            bool dirty = false;
+            if ((kr & KEY_UP)   && sel > 0)        { sel--; dirty = true; }
+            if ((kr & KEY_DOWN) && sel < nEnt - 1) { sel++; dirty = true; }
+            if (sel < scrollTop) scrollTop = sel;
+            if (sel >= scrollTop + BR_ROWS) scrollTop = sel - (BR_ROWS - 1);
+            if (kd & KEY_B) { browsing = false; topFull = true; fullRedraw = true; }
+            else if ((kd & KEY_A) && nEnt > 0) {
+                if (ents[sel].dir) {
+                    if (chdir(ents[sel].name) == 0) scanDir();
+                    dirty = true;
+                } else {
+                    // el deck que se carga se detiene; el otro sigue sonando (loadWav bombea el audio)
+                    dk->playing = false;
+                    leadGoal = 3328 * 16;                         // colchon grande: el otro deck no se corta
+                    audioTick();
+                    drawLoadScreen(ents[sel].name);
+                    const char *err = loadWav(ents[sel].name);
+                    audioTick();
+                    leadGoal = LEAD * 16;
+                    if (err) {
+                        if (dk->lostSample) useDemo("[demo]");   // la carga fallida nos dejo sin sample
+                        dk->playing = false;
+                        drawErrorScreen(err);
+                        while (1) { swiWaitForVBlank(); scanKeys(); audioTick(); if (keysDown() & (KEY_A | KEY_B)) break; }
+                        dirty = true;
+                    } else {
+                        browsing = false;
+                        topFull = true;
+                    }
+                    fullRedraw = true;
+                    uiDirty = true;
+                }
+            }
+            if (dirty && browsing) drawBrowser();
+        } else {
+            freezeKey = (kh & KEY_B) != 0;
+            if (kd & KEY_START)  togglePlay();
+            if (kd & KEY_SELECT) { actDeck ^= 1; dk = &decks[actDeck]; fullRedraw = true; topFull = true; }
+            if (kd & KEY_Y)      { dk->loopStart = 0; dk->loopEnd = (s32)dk->srcLen - 1; }
+            if (kr & KEY_L)      setXfade(xfade - 8);
+            if (kr & KEY_R)      setXfade(xfade + 8);
+            if (kr & KEY_UP)     cur = (cur + P_COUNT - 1) % P_COUNT;
+            if (kr & KEY_DOWN)   cur = (cur + 1) % P_COUNT;
+            if (kr & KEY_LEFT)   adjust(-1);
+            if (kr & KEY_RIGHT)  adjust(+1);
+
+            // pantalla tactil: botones abajo, crossfader en el medio, scrub vertical en las columnas
+            if (kh & KEY_TOUCH) {
+                touchPosition t;
+                touchRead(&t);
+                if (kd & KEY_TOUCH) {
+                    touchDrag = false;
+                    if (t.py >= BAR_Y) {
+                        if (t.px < 52)       togglePlay();
+                        else if (t.px < 102) toggleLoop();
+                        else if (t.px < 152) seekTo(dk->loopStart);
+                        else if (t.px < 202) openBrowser();
+                        else               { dk->loopStart = 0; dk->loopEnd = (s32)dk->srcLen - 1; }
+                    } else if (t.py >= XF_Y - 2) {
+                        xfDrag = true;
+                    } else if (t.py >= TOPY) {
+                        touchDeck = t.px < 128 ? 0 : 1;
+                        if (touchDeck != actDeck) { actDeck = touchDeck; dk = &decks[actDeck]; fullRedraw = true; topFull = true; }
+                        touchDrag = true;
+                        if (loopEdit) {
+                            loopAnchor = clampi(t.py - TOPY, 0, PH - 1);
+                            loopAnchor = (s32)((u32)loopAnchor * (dk->srcLen - 1) / (PH - 1));
+                        }
+                    } else {                                      // etiquetas A / B: elegir deck
+                        touchDeck = t.px < 128 ? 0 : 1;
+                        if (touchDeck != actDeck) { actDeck = touchDeck; dk = &decks[actDeck]; fullRedraw = true; topFull = true; }
+                    }
+                }
+                if (xfDrag) setXfade((t.px - 20) * 256 / 216);
+                if (touchDrag) {
+                    s32 r = clampi(t.py - TOPY, 0, PH - 1);
+                    s32 idx = (s32)((u32)r * (dk->srcLen - 1) / (PH - 1));
+                    if (loopEdit) {                               // el stylus arrastra y delimita el loop
+                        dk->loopStart = idx < loopAnchor ? idx : loopAnchor;
+                        dk->loopEnd   = idx < loopAnchor ? loopAnchor : idx;
+                        fixLoop(true);
+                    } else seekTo(idx);
+                }
+            } else {
+                if (touchDrag && loopEdit && (dk->posI < dk->loopStart || dk->posI >= dk->loopEnd)) seekTo(dk->loopStart);
+                touchDrag = false; xfDrag = false;
+            }
+            touching = touchDrag;
+        }
+
+        // pantallas primero: justo despues del vblank no se ven cortes
+        s32 lt = leadT - (s32)((TIMER_DATA(0) - tPrev) & 0xFFFF);
+        u32 lead = lt > 0 ? (u32)lt / 16 : 0;
+        updateView(lead);
+        if (!browsing) {
+            for (int di = 0; di < 2; di++) decks[di].reel += decks[di].playing ? 9000 : 0;   // carretes girando
+            if (uiDirty || (++frame & 1) == 0) { drawMain(lead); uiDirty = false; }
+        }
+
+        // audio: renderiza por delante del playhead
+        audioTick();
+    }
+    return 0;
+}
