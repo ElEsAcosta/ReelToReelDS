@@ -18,6 +18,12 @@ jobs:
           repository: devkitPro/nds-examples
           path: nds-examples
 
+      - name: Checkout del decodificador mp3 (Helix, punto fijo)
+        uses: actions/checkout@v4
+        with:
+          repository: chmorgan/libhelix-mp3
+          path: helix-src
+
       - name: Instalar nds-dev (con reintentos)
         run: |
           if [ -d "$DEVKITPRO/libnds" ]; then echo "libnds ya instalado"; exit 0; fi
@@ -32,13 +38,16 @@ jobs:
           cp -r nds-examples/templates/arm9 proj
           rm -f proj/source/*
           cp granular.c proj/source/main.c
+          mkdir -p proj/source/helix
+          cp helix-src/src/mp3dec.c helix-src/src/mp3tabs.c helix-src/src/real/*.c helix-src/src/real/*.h helix-src/src/pub/*.h proj/source/helix/
+          sed -i 's|^SOURCES .*|SOURCES  := source source/helix|' proj/Makefile
           sed -i 's/-lnds9/-lfat -lnds9 -lm/' proj/Makefile
           if [ -f icon.png ]; then cp icon.png proj/icon.png; fi
 
       - name: Compilar (con icono; si falla, sin icono)
         working-directory: proj
         run: |
-          if [ -f icon.png ] && make GAME_TITLE="EFEES" GAME_SUBTITLE1="Reel to reel" GAME_SUBTITLE2="by Angel" GAME_ICON=icon.png; then
+          if [ -f icon.png ] && make GAME_TITLE="EFEES" GAME_SUBTITLE1="Reel to reel" GAME_SUBTITLE2="by Angel" ICON=icon.png; then
             echo "compilado con icono"
           else
             make clean
