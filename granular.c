@@ -43,11 +43,11 @@
 // El volumen de la nube se compensa solo segun cuantos granos se solapan (densidad x tamano),
 // asi un pad grueso no suena mas fuerte que uno disperso.
 //
-// WAV soportados: PCM 8/16/24 bit, mono o estereo, cualquier frecuencia. Se mezcla a mono,
+// Audio soportado: MP3 (decodificado en la DS con Helix) y WAV. WAV: PCM 8/16/24 bit, mono o estereo, cualquier frecuencia. Se mezcla a mono,
 // se normaliza y se guarda en 8 bit; si no cabe en RAM (la DS tiene 4 MB) se reduce la
 // frecuencia de muestreo. La primera carga de cada WAV crea "<archivo>.wav.gr8" en la SD
 // (version liviana); las siguientes cargas son casi instantaneas.
-// MP3 y otros formatos: convertirlos antes en el PC con to_ds.py.
+// Otros formatos (flac, ogg, m4a...): convertirlos antes en el PC con to_ds.py.
 
 #include <nds.h>
 #include <fat.h>
@@ -58,6 +58,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <math.h>
+#include "helix/mp3dec.h"
 
 #define OUT_RATE    32768   // lo que pedimos; el hardware corre a ~32728.5 Hz
 #define OUT_LEN     4096    // anillo de salida: 4096 muestras = 1 vuelta del timer (DIV_64)
@@ -164,10 +165,10 @@ static u16 *fbTop;                    // pantalla de arriba: parametros / navega
 #define C_GRAY     RGB8(146, 146, 154)
 #define C_LGRAY    RGB8(204, 204, 210)
 #define C_WHITE    RGB8(255, 255, 255)
-#define C_YEL      RGB8(255, 196, 220)      // rosa claro
-#define C_YELD     RGB8(186, 124, 150)
-#define C_ORG      RGB8(255,  74, 156)      // rosa fuerte
-#define C_ORGD     RGB8(176,  44, 104)
+#define C_YEL      RGB8(250, 216, 228)      // rosa claro
+#define C_YELD     RGB8(176, 138, 154)
+#define C_ORG      RGB8(236, 144, 182)      // rosa fuerte
+#define C_ORGD     RGB8(150,  92, 120)
 
 #define FONT_W 6
 #define FONT_H 10
@@ -860,6 +861,159 @@ static void saveCache(const char *name, u32 wavSize, const s8 *buf, u32 len, u32
     if (!ok) remove(cn);
 }
 
+// ---- canalizacion comun: mono s16 -> decimacion con promedio -> s8 normalizado
+typedef struct { s8 *buf; u32 j, outLen, phase, cnt, rate, storeRate; s32 acc; int pk; } Pipe;
+
+static s8 *pipeAlloc(Pipe *p, u32 frames, u32 rate) {
+    u32 budget = BUDGET, storeRate, outLen;
+    s8 *buf = NULL;
+    while (1) {
+        storeRate = rate;
+        if (storeRate > 32728) storeRate = 32728;
+        if ((u64)frames * storeRate / rate > budget)
+            storeRate = (u32)((u64)budget * rate / frames);
+        if (storeRate < 4000) storeRate = 4000;
+        outLen = (u32)((u64)frames * storeRate / rate);
+        buf = (s8 *)malloc(outLen);
+        if (buf) break;
+        budget = budget * 3 / 4;
+        if (budget < 200000) return NULL;
+    }
+    p->buf = buf; p->j = 0; p->outLen = outLen; p->phase = 0; p->cnt = 0;
+    p->rate = rate; p->storeRate = storeRate; p->acc = 0; p->pk = 0;
+    return buf;
+}
+
+static inline void pipePush(Pipe *p, s32 m) {
+    p->acc += m; p->cnt++;
+    p->phase += p->storeRate;
+    if (p->phase >= p->rate) {                      // decimacion con promedio (anti-alias basico)
+        p->phase -= p->rate;
+        if (p->j < p->outLen) {
+            s8 v = (s8)((p->acc / (s32)p->cnt) >> 8);
+            int av = v < 0 ? -v : v;
+            if (av > p->pk) p->pk = av;
+            p->buf[p->j++] = v;
+        }
+        p->acc = 0; p->cnt = 0;
+    }
+}
+
+static const char *pipeFinish(Pipe *p, const char *name, u32 fileSize) {
+    s8 *buf = p->buf;
+    u32 j = p->j;
+    if (j < 256) { free(buf); return "error leyendo la SD"; }
+    if (p->pk > 0 && p->pk < 110) {                 // normaliza: sube samples bajitos hasta ~127
+        s32 mul = (127 << 8) / p->pk;
+        for (u32 i = 0; i < j; i++) {
+            s32 v = ((s32)buf[i] * mul) >> 8;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            buf[i] = (s8)v;
+        }
+    }
+    dk->heapBuf = buf; dk->src = buf; dk->srcLen = j; dk->srcRate = p->storeRate;
+    dk->lostSample = false;
+    strncpy(dk->curName, name, sizeof(dk->curName) - 1);
+    computeAuto();
+    updateInc();
+    resetTransport(false, false);                   // los tracks cargan en pausa, al inicio
+    computePeaks();
+    drawLoadBar(100);
+    drawLoadNote("guardando cache...");
+    saveCache(name, fileSize, buf, j, p->storeRate);
+    return NULL;
+}
+
+// ---- MP3: decodificador de punto fijo Helix (el ARM9 no tiene FPU)
+#define MP3_IN 8192
+static const char *loadMp3(FILE *f, const char *name, u32 fileSize) {
+    u8 *ib = (u8 *)malloc(MP3_IN);
+    s16 *pcm = (s16 *)malloc(MAX_NSAMP * MAX_NGRAN * MAX_NCHAN * sizeof(s16));
+    HMP3Decoder dec = (ib && pcm) ? MP3InitDecoder() : NULL;
+    if (!dec) { free(ib); free(pcm); fclose(f); return "sin memoria"; }
+    const char *err = NULL;
+
+    // salta la etiqueta ID3v2 si existe
+    u32 dataStart = 0;
+    if (fread(ib, 1, 10, f) == 10 && !memcmp(ib, "ID3", 3))
+        dataStart = 10 + (((u32)ib[6] & 0x7F) << 21 | ((u32)ib[7] & 0x7F) << 14 | ((u32)ib[8] & 0x7F) << 7 | ((u32)ib[9] & 0x7F));
+    fseek(f, (long)dataStart, SEEK_SET);
+
+    // primer cuadro valido: frecuencia, canales y duracion estimada
+    size_t have = fread(ib, 1, MP3_IN, f);
+    int off = MP3FindSyncWord(ib, (int)have);
+    MP3FrameInfo fi;
+    if (off < 0 || MP3GetNextFrameInfo(dec, &fi, ib + off) != 0 || fi.layer != 3 || fi.samprate < 8000) {
+        err = "no es un mp3 valido";
+    }
+    Pipe pp;
+    u32 frames = 0;
+    if (!err) {
+        u32 spf = fi.version == MPEG1 ? 1152 : 576;
+        u32 fr = 0;
+        int xo = (fi.version == MPEG1 ? (fi.nChans == 2 ? 32 : 17) : (fi.nChans == 2 ? 17 : 9)) + 4;
+        const u8 *x = ib + off + xo;                       // cabecera Xing/Info: cuenta exacta de cuadros (VBR)
+        if ((size_t)off + (size_t)xo + 12 < have && (!memcmp(x, "Xing", 4) || !memcmp(x, "Info", 4)) && (x[7] & 1))
+            fr = ((u32)x[8] << 24) | ((u32)x[9] << 16) | ((u32)x[10] << 8) | x[11];
+        if (fr) frames = fr * spf;
+        else if (fi.bitrate > 0)                           // CBR: tamano / bitrate
+            frames = (u32)((u64)(fileSize - dataStart) * 8 * (u64)fi.samprate / (u32)fi.bitrate);
+        if (frames > (u32)MAX_SECS * (u32)fi.samprate) frames = (u32)MAX_SECS * (u32)fi.samprate;
+        if (frames < 2048) err = "archivo muy corto";
+    }
+    if (!err) {
+        resetSrc();
+        if (!pipeAlloc(&pp, frames, (u32)fi.samprate)) err = "sin memoria";
+    }
+    if (err) { MP3FreeDecoder(dec); free(ib); free(pcm); fclose(f); return err; }
+
+    u32 done = 0, bad = 0, nb = 0, outSamps = 0;
+    bool eof = (have < MP3_IN);
+    while (done < frames && bad < 400) {
+        if (have < 3000 && !eof) {                         // rellena el buffer de entrada
+            size_t got = fread(ib + have, 1, MP3_IN - have, f);
+            have += got;
+            if (got == 0) eof = true;
+        }
+        int o = MP3FindSyncWord(ib, (int)have);
+        if (o < 0) { have = 0; if (eof) break; continue; }
+        if (o > 0) { memmove(ib, ib + o, have - (size_t)o); have -= (size_t)o; }
+        const u8 *p = ib;
+        size_t left = have;
+        int r = MP3Decode(dec, &p, &left, pcm, 0);
+        size_t used = (size_t)(p - ib);
+        if (r == ERR_MP3_NONE) {
+            MP3FrameInfo li;
+            MP3GetLastFrameInfo(dec, &li);
+            int nc = li.nChans ? li.nChans : 1;
+            u32 ns = (u32)li.outputSamps / (u32)nc;
+            for (u32 i = 0; i < ns && done < frames; i++, done++)
+                pipePush(&pp, nc == 2 ? ((s32)pcm[2 * i] + (s32)pcm[2 * i + 1]) >> 1 : (s32)pcm[i]);
+            outSamps += ns;
+            bad = 0;
+        } else if (r == ERR_MP3_INDATA_UNDERFLOW || r == ERR_MP3_MAINDATA_UNDERFLOW) {
+            if (used == 0) used = 1;                       // evita quedarnos pegados
+            if (eof && have < 1500) break;
+            bad++;
+        } else {
+            if (used == 0) used = 1;                       // cuadro danado: salta un byte y resincroniza
+            bad++;
+        }
+        if (used > have) used = have;
+        memmove(ib, ib + used, have - used);
+        have -= used;
+        if (have == 0 && eof) break;
+        audioTick();
+        if ((++nb & 7) == 0) drawLoadBar((int)(done / (frames / 100 + 1)));
+    }
+    (void)outSamps;
+    MP3FreeDecoder(dec);
+    free(ib); free(pcm);
+    fclose(f);
+    return pipeFinish(&pp, name, fileSize);
+}
+
 // devuelve NULL si todo bien, o un mensaje de error
 static const char *loadWav(const char *name) {
     FILE *f = fopen(name, "rb");
@@ -869,6 +1023,10 @@ static const char *loadWav(const char *name) {
     u32 wavSize = (u32)ftell(f);
     fseek(f, 0, SEEK_SET);
     if (loadCache(name, wavSize)) { fclose(f); return NULL; }   // ya convertido antes
+    {
+        size_t nl = strlen(name);
+        if (nl > 4 && !strcasecmp(name + nl - 4, ".mp3")) return loadMp3(f, name, wavSize);
+    }
 
     u8 h[12];
     if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
@@ -913,28 +1071,11 @@ static const char *loadWav(const char *name) {
     // liberamos el sample anterior antes de pedir RAM; si falla volvemos al demo
     resetSrc();
 
-    u32 budget = BUDGET, storeRate, outLen;
-    s8 *buf = NULL;
-    while (1) {
-        storeRate = rate;
-        if (storeRate > 32728) storeRate = 32728;
-        if ((u64)frames * storeRate / rate > budget)
-            storeRate = (u32)((u64)budget * rate / frames);
-        if (storeRate < 4000) storeRate = 4000;
-        outLen = (u32)((u64)frames * storeRate / rate);
-        buf = (s8 *)malloc(outLen);
-        if (buf) break;
-        budget = budget * 3 / 4;
-        if (budget < 200000) { fclose(f); return "sin memoria"; }
-    }
-
+    Pipe pp;
+    if (!pipeAlloc(&pp, frames, rate)) { fclose(f); return "sin memoria"; }
     u8 *blk = (u8 *)malloc(4096);
-    if (!blk) { free(buf); fclose(f); return "sin memoria"; }
-    u32 perBlk = 4096 / blockAlign;
-
-    u32 j = 0, done = 0, phase = 0, cnt = 0, nb = 0;
-    s32 acc = 0;
-    int pk = 0;                                             // pico del sample (para normalizar)
+    if (!blk) { free(pp.buf); fclose(f); return "sin memoria"; }
+    u32 perBlk = 4096 / blockAlign, done = 0, nb = 0;
     while (done < frames) {
         u32 n = frames - done;
         if (n > perBlk) n = perBlk;
@@ -952,18 +1093,7 @@ static const char *loadWav(const char *name) {
                 m = (s16)rd16(p + 1);                       // 24 bit: nos quedamos con los 16 altos
                 if (ch == 2) m = (m + (s16)rd16(p + 4)) >> 1;
             }
-            acc += m; cnt++;
-            phase += storeRate;
-            if (phase >= rate) {                            // decimacion con promedio (anti-alias basico)
-                phase -= rate;
-                if (j < outLen) {
-                    s8 v = (s8)((acc / (s32)cnt) >> 8);
-                    int av = v < 0 ? -v : v;
-                    if (av > pk) pk = av;
-                    buf[j++] = v;
-                }
-                acc = 0; cnt = 0;
-            }
+            pipePush(&pp, m);
         }
         done += n;
         audioTick();
@@ -971,31 +1101,7 @@ static const char *loadWav(const char *name) {
     }
     free(blk);
     fclose(f);
-
-    if (j < 256) { free(buf); return "error leyendo la SD"; }
-
-    if (pk > 0 && pk < 110) {                               // normaliza: sube samples bajitos hasta ~127
-        s32 mul = (127 << 8) / pk;
-        for (u32 i = 0; i < j; i++) {
-            s32 v = ((s32)buf[i] * mul) >> 8;
-            if (v > 127) v = 127;
-            if (v < -127) v = -127;
-            buf[i] = (s8)v;
-        }
-    }
-
-    dk->heapBuf = buf; dk->src = buf; dk->srcLen = j; dk->srcRate = storeRate;
-    dk->lostSample = false;
-    strncpy(dk->curName, name, sizeof(dk->curName) - 1);
-    computeAuto();
-    updateInc();
-    resetTransport(false, false);                           // los tracks cargan en pausa, al inicio
-    computePeaks();
-
-    drawLoadBar(100);
-    drawLoadNote("guardando cache...");
-    saveCache(name, wavSize, buf, j, storeRate);
-    return NULL;
+    return pipeFinish(&pp, name, wavSize);
 }
 
 // ---------------------------------------------------------------- navegador
@@ -1020,7 +1126,7 @@ static void scanDir(void) {
         bool dir = (e->d_type == DT_DIR);
         if (!dir) {
             size_t n = strlen(e->d_name);
-            if (n < 5 || strcasecmp(e->d_name + n - 4, ".wav")) continue;
+            if (n < 5 || (strcasecmp(e->d_name + n - 4, ".wav") && strcasecmp(e->d_name + n - 4, ".mp3"))) continue;
         }
         strncpy(ents[nEnt].name, e->d_name, sizeof(ents[nEnt].name) - 1);
         ents[nEnt].name[sizeof(ents[nEnt].name) - 1] = 0;
@@ -1039,7 +1145,7 @@ static void drawBrowser(void) {
     if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "?");
     snprintf(t, sizeof t, "%.34s", cwd);
     drawHeader("SD", t, C_ORG);
-    if (nEnt == 0) text(fbTop, 8, 24, "(sin .wav ni carpetas)", C_GRAY, 1);
+    if (nEnt == 0) text(fbTop, 8, 24, "(sin .mp3/.wav ni carpetas)", C_GRAY, 1);
     for (int r = 0; r < BR_ROWS; r++) {
         int i = scrollTop + r;
         if (i >= nEnt) break;
@@ -1142,7 +1248,7 @@ static void valStr(int i, char *b, size_t n) {
         case P_REVERB: snprintf(b, n, "%ld%%", (long)revMixPct); break;
         case P_DECAY: snprintf(b, n, "%ld%%", (long)decayPct); break;
         case P_VOL:   snprintf(b, n, "%ld.%ld x", (long)(tg / 16), (long)((tg % 16) * 10 / 16)); break;
-        case P_LOAD:  snprintf(b, n, "%s", sdOK ? (actDeck ? "WAV -> B >" : "WAV -> A >") : "sin SD"); break;
+        case P_LOAD:  snprintf(b, n, "%s", sdOK ? (actDeck ? "audio -> B >" : "audio -> A >") : "sin SD"); break;
         default:      b[0] = 0; break;
     }
 }
