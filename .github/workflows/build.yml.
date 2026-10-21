@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm
+    steps:
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Checkout de nds-examples (template oficial)
+        uses: actions/checkout@v4
+        with:
+          repository: devkitPro/nds-examples
+          path: nds-examples
+
+      - name: Instalar nds-dev (con reintentos)
+        run: |
+          if [ -d "$DEVKITPRO/libnds" ]; then echo "libnds ya instalado"; exit 0; fi
+          for i in 1 2 3 4 5; do
+            dkp-pacman -Sy --noconfirm nds-dev && exit 0
+            echo "intento $i fallo, reintentando..."; sleep 20
+          done
+          exit 1
+
+      - name: Preparar proyecto
+        run: |
+          cp -r nds-examples/templates/arm9 proj
+          rm -f proj/source/*
+          cp granular.c proj/source/main.c
+          sed -i 's/-lnds9/-lfat -lnds9 -lm/' proj/Makefile
+          if [ -f icon.png ]; then cp icon.png proj/icon.png; fi
+
+      - name: Compilar (con icono; si falla, sin icono)
+        working-directory: proj
+        run: |
+          if [ -f icon.png ] && make GAME_TITLE="EFEES" GAME_SUBTITLE1="Reel to reel" GAME_SUBTITLE2="by Angel" GAME_ICON=icon.png; then
+            echo "compilado con icono"
+          else
+            make clean
+            make GAME_TITLE="EFEES" GAME_SUBTITLE1="Reel to reel" GAME_SUBTITLE2="by Angel"
+          fi
+          cp *.nds ../granular.nds
+
+      - name: Subir granular.nds
+        uses: actions/upload-artifact@v4
+        with:
+          name: granular-nds
+          path: granular.nds
