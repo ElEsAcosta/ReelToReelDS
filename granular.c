@@ -1,47 +1,30 @@
-// granular.c - sampler granular para tracks enteros en Nintendo DS/DSi (libnds + libfat, ARM9)
+// granular.c - EFEES "reel to reel": sampler granular de dos cintas (decks A/B) para Nintendo DS/DSi
+// (libnds + libfat, ARM9)
 //
-// Idea: la "cabeza de lectura" avanza sola por el track (play), y alrededor de ella se
-// disparan granos. Velocidad y pitch son independientes: puedes estirar, congelar o
-// invertir el track sin cambiar el tono (o al reves). Con DROP sueltas el track entero,
-// limpio, sin ninguna modificacion, y puedes volver a la nube desde donde va la cancion.
+// Idea: en cada deck la cabeza de lectura avanza sola por el track (siempre en loop) y alrededor
+// de ella se disparan granos. Velocidad y pitch son independientes. Un crossfader mezcla los decks.
 //
-// PANTALLA DE ABAJO (tactil): forma de onda en tiempo real
-//   toca / arrastra la onda : scrub (suena aunque estes en pausa; si estabas en DROP, lo suelta)
-//   botones: [play/pausa] [loop] [inicio] [SD = cargar WAV] [DROP]
-//   linea naranja = cabeza de lectura (blanca en DROP), onda amarilla = ya reproducido, gris = por tocar,
-//   fondo calido = region de loop, banda clara = spray, onda blanca = ancho de un grano,
-//   marcas amarillas arriba = granos sonando
-// Paleta: grises, amarillo claro, blanco y naranja. Las dos pantallas son bitmaps con fuente propia.
+// DOS VISTAS (se pueden intercambiar de pantalla con A o el boton PANTALLAS / PANT.)
+//   KNOBS (3 paginas: MEZCLA, NUBE, ESPACIO): carretes de cada deck + perillas
+//   ONDAS: una columna vertical por deck (el tiempo corre hacia abajo), crossfader y botones
+//   La que este abajo responde al stylus: arrastra un knob hacia arriba/abajo para cambiarlo,
+//   toca una pestana para cambiar de pagina, toca la onda para mover la cabeza.
 //
-// BOTONES
-//   START       play / pausa
-//   A           DROP: fundido hacia el track limpio; otra vez A vuelve a la nube (retoma donde va la cancion)
-//   B (mantener) freeze: congela la cabeza, sigue sonando la nube de granos
-//   SELECT      loop on/off
-//   X / Y       fijar inicio / fin del loop en la posicion actual (Y activa el loop)
-//   L / R       saltar -5 s / +5 s (en DROP salta el track limpio)
-//   Arr / Abajo elegir parametro, Izq / Der cambiar su valor
+// TECLAS
+//   START       play / pausa del deck activo        SELECT   cambia de deck activo (A/B)
+//   A           intercambia las pantallas           B (mantener)  freeze de la cabeza
+//   L / R       crossfader                          X / Y    pagina de knobs anterior / siguiente
+//   Izq / Der   elegir knob                         Arr / Abajo   cambiar su valor
 //
-// PARAMETROS (menu de arriba, con scroll)
-//   VELOCID -200..+200 %   (0 = congelado, negativo = hacia atras, sin cambiar el pitch)
-//   PITCH -24..+24 st   TAMANO 10..2000 ms   DENSID 1..100 granos/s
-//   SPRAY 0..500 ms (aleatoriedad de posicion)   DERIVA 0..100 (la posicion divaga lentamente)
-//   ARMONIA 0..100 % de granos transpuestos a -12/-5/+7/+12
-//   JITTER 0..100 cents   REVERSA 0..100 % de granos al reves
-//   REVERB 0..100 % mezcla   COLA 0..100 (largo de la cola, hasta ~10 s)
-//   ESTEREO 0..100  cuanto se abre la nube en el panorama (cada grano cae en un lugar distinto)
-//   SHIMMER 0..100  granos en octavas (+12/+24/+19/-12) que suben y bajan solos (~17 s) y suenan sobre todo
-//                   dentro de la reverb, como un pad brillante
-//   FILTRO  pasa-bajos de toda la salida (40 Hz .. 9 kHz; 100 = abierto)   BARRIDO 0..100 profundidad de un
-//                   barrido lento y automatico del filtro (~12 s por ciclo)
-//   DELAY 0..100 mezcla de eco estereo (ping-pong: los ecos rebotan de un oido al otro)
-//   TIEMPO 50..1000 ms (cambiarlo desliza el tono como una cinta)   REPITE 0..95 cuanto se repite
-//   VOLUMEN (el volumen automatico sube solo los tracks flojos; 1.0x = nivel base)   FUNDIDO 0.05..16 s (duracion del DROP)
-//   DROP DE inicio / la cabeza (desde donde arranca el track limpio)
-//   CARGAR  abre la SD (tambien: boton de carpeta)
+// LOOP: los dos decks siempre estan en loop (por defecto el track entero). Boton LOOP = modo EDITAR:
+// toca y arrastra en la onda con el stylus para delimitar el loop. TODO = loop del track completo.
 //
-// El volumen de la nube se compensa solo segun cuantos granos se solapan (densidad x tamano),
-// asi un pad grueso no suena mas fuerte que uno disperso.
+// KNOBS
+//   MEZCLA : XFADE, VELOCID (-200..+200 %, por deck), PITCH (+-24 st, por deck), VOLUMEN (3.0x por defecto),
+//            ESTEREO, FLUTTER (wow & flutter de cinta)
+//   NUBE   : TAMANO, DENSID, SPRAY, DERIVA, ARMONIA, SHIMMER, JITTER, REVERSA
+//   ESPACIO: REVERB, COLA, TAPE DLY (delay de cinta de una sola perilla), FILTRO, BARRIDO
+// Compresor de salida fijo (4:1) y limitador suave al final.
 //
 // Audio soportado: MP3 (decodificado en la DS con Helix) y WAV. WAV: PCM 8/16/24 bit, mono o estereo, cualquier frecuencia. Se mezcla a mono,
 // se normaliza y se guarda en 8 bit; si no cabe en RAM (la DS tiene 4 MB) se reduce la
@@ -114,7 +97,7 @@ static int actDeck = 0;
 static s32 xfade = 0;                // crossfader 0 = solo A ... 256 = solo B
 static s32 xfGainA = 256, xfGainB = 0;
 static s32 xgS[2] = { 256 << 8, 0 };    // ganancias suavizadas (Q16) para que mover el crossfader no haga clicks
-static s32 grainCap = MAX_GRAINS;       // tope de granos por deck; baja solo si la CPU no da abasto   // ganancias de potencia constante (Q8)
+static s32 grainCap = 8;              // tope de granos por deck; baja solo si la CPU no da abasto   // ganancias de potencia constante (Q8)
 
 static bool touching = false, freezeKey = false;
 static bool loopEdit = false;        // modo editar loop: el stylus delimita el loop en la onda
@@ -127,16 +110,18 @@ static const char *const fadeTxt[8] = { "0.05 s", "0.25 s", "0.5 s", "1 s", "2 s
 static s32 sizeMs = 120, density = 24, sprayMs = 30;
 static s32 driftPct = 0, harmPct = 0, jitterC = 0, revPct = 0;
 static s32 revMixPct = 20, decayPct = 60;
-static s32 panPct = 60, shimPct = 0, filtPct = 100, sweepPct = 0;
-static s32 delayPct = 0, delayMs = 375, delayFbPct = 45;
-static s32 gain = 40;                // volumen de la nube, Q4; el track limpio usa gain*2/5 (40 = 1.0x)
+static s32 panPct = 80, shimPct = 0, filtPct = 100, sweepPct = 0;
+static s32 delayPct = 0;           // delay de cinta: una sola perilla (mezcla + repeticiones)
+static s32 flutPct = 0;            // flutter / wow de cinta
+static s32 gain = 120;               // volumen de la nube, Q4: 40 = 1.0x, por defecto 3.0x
 static s32 normQ = 256;              // compensacion por solapamiento de granos (Q8)
 static s32 fadeStep = 1000;          // avance de mixQ por muestra
 static s32 harmRatio[4];             // razones Q16 de -12, -5, +7, +12 semitonos
 
 static u32 rng = 2463534242u;
 static bool sdOK = false;
-static bool browsing = false, touchDrag = false, xfDrag = false;     // navegador de la SD abierto / arrastre en la onda
+static bool browsing = false, touchDrag = false, xfDrag = false;
+static int kDrag = -1, kY0 = 0, kDone = 0;          // arrastre de un knob con el stylus     // navegador de la SD abierto / arrastre en la onda
 
 static bool fullRedraw = true;
 
@@ -350,6 +335,7 @@ static void drawLoadScreen(const char *name) {
     snprintf(t, sizeof t, "%.34s", name);
     text(fbTop, 8, 40, t, C_WHITE, 1);
     rect(fbTop, 8, 62, 240, 8, C_PANEL2);
+    text(fbTop, 8, 120, "B = cancelar", C_GRAY, 1);
 }
 
 static void drawLoadBar(int pct) {
@@ -386,8 +372,16 @@ static Comb apsR[2]  = { { ab2, 509, 0, 0 }, { ab3, 379, 0, 0 } };
 static s32 revMix = 51, revFb = 220, revDamp = 80;      // Q8
 
 static void updateReverb(void) {
+    decayPct = 45 + revMixPct * 50 / 100;               // una sola perilla: mas reverb = mas mezcla y mas cola
     revMix = revMixPct * 256 / 100;
     revFb  = 179 + decayPct * 69 / 100;                  // 0.70 .. 0.97
+}
+
+static u32 revIdle = 0;
+static void revClear(void) {
+    memset(cb0, 0, sizeof cb0); memset(cb1, 0, sizeof cb1); memset(cb2, 0, sizeof cb2); memset(cb3, 0, sizeof cb3);
+    memset(ab0, 0, sizeof ab0); memset(ab1, 0, sizeof ab1); memset(ab2, 0, sizeof ab2); memset(ab3, 0, sizeof ab3);
+    for (int i = 0; i < 4; i++) { combs[i].lp = 0; }
 }
 
 static s32 apRun(Comb *a, s32 w) {                       // difusion (allpass)
@@ -536,13 +530,36 @@ static u32 dW = 0;
 static s32 dtCur = 0, dtTgt = 0;              // tiempo actual / objetivo en muestras Q8 (el actual se desliza)
 static s32 dFb = 115, dMix = 0, dLpL = 0, dLpR = 0;
 
+#define DLY_TIME_MS 420                       // un tape delay: tiempo fijo, lo que cambia es cuanto se repite
 static void updateDelay(void) {
-    dtTgt = (s32)((float)delayMs * 32.7285f * 256.0f);
-    dFb   = delayFbPct * 256 / 100;
-    dMix  = delayPct * 256 / 100;
+    dtTgt = (s32)((float)DLY_TIME_MS * 32.7285f * 256.0f);
+    dFb   = 70 + delayPct * 130 / 100;        // 0.27 .. 0.78
+    dMix  = delayPct * 230 / 100;             // hasta 0.9
 }
 
+// ---- wow & flutter de cinta: LFOs lentos + una linea de retardo corta (vibrato) en la salida
+#define WOW_INC  72180u                       // 0.55 Hz
+#define FL1_INC  826800u                      // 6.3 Hz
+#define FL2_INC  1194400u                     // 9.1 Hz
+#define VB_LEN   256
+static s16 vbL[VB_LEN], vbR[VB_LEN];
+static u32 vbW = 0, phWow = 0, phFl1 = 0, phFl2 = 0;
+static s32 wowAmp = 0, flAmp = 0;             // profundidad en muestras
+static void updateFlutter(void) { wowAmp = flutPct * 90 / 100; flAmp = flutPct * 14 / 100; }
+
+// seno parabolico: ph (32 bit = una vuelta) -> -32768..32767
+static s32 lfoSin(u32 ph) {
+    s32 x = (s32)(s16)(ph >> 16);
+    s32 ax = x < 0 ? -x : x;
+    return (x * (32768 - ax)) >> 13;
+}
+
+// compresor fijo de la salida (4:1 sobre -12 dBFS, ataque ~2 ms, suelta ~150 ms) con ganancia de compensacion
+#define COMP_T 8000
+static s32 cEnv = 0, cG = 32768, cTgt = 32768;
+
 // ---- estereo, shimmer y filtro
+static s32 sinT[64];                                   // Q8: seno en 64 pasos (para carretes y knobs)
 static s32 panTab[33];                        // ganancias Q8 de potencia constante (centro = 256 en cada oido)
 static s32 shimRatio[4];                      // razones Q16 de +12, +24, +19 y -12 semitonos
 static s32 aTab[128], fcHz[128];              // coeficiente (Q15) y frecuencia del filtro por paso
@@ -554,6 +571,7 @@ static u32 fCnt = 0;
 #define SHIM_INC  7720u                       // 2^32 / (17 s * 32728.5 Hz)
 
 static void initTables(void) {
+    for (int i = 0; i < 64; i++) sinT[i] = (s32)(256.0f * sinf(6.2831853f * (float)i / 64.0f));
     for (int i = 0; i <= 32; i++) panTab[i] = (s32)(362.0f * cosf((float)i * 3.14159265f / 64.0f));
     shimRatio[0] = (s32)(65536.0f * exp2f(12.0f / 12.0f));
     shimRatio[1] = (s32)(65536.0f * exp2f(24.0f / 12.0f));
@@ -700,14 +718,14 @@ static void deckRender(Deck *d, s32 xg, s32 *oDL, s32 *oDR, s32 *oSL, s32 *oSR, 
                 gr->wpos += gr->winc;
             }
             // el shimmer se oye poco directo y mucho dentro de la reverb
-            dL = softClip(SCALE(aL + ((zL * 90) >> 8)));
-            dR = softClip(SCALE(aR + ((zR * 90) >> 8)));
+            dL = clampi(SCALE(aL + ((zL * 90) >> 8)), -262143, 262143);   // el limite lo pone el compresor de salida
+            dR = clampi(SCALE(aR + ((zR * 90) >> 8)), -262143, 262143);
             sL = softClip(SCALE(aL + zL + (zL >> 1)));
             sR = softClip(SCALE(aR + zR + (zR >> 1)));
         }
     }
     s32 fadeG = ((32768 - (dk->mixQ >> 9)) * xg) >> 8;             // Q15: fundido del DROP x crossfader
-    *oDL = (dL * fadeG) >> 15; *oDR = (dR * fadeG) >> 15;
+    *oDL = ((dL >> 3) * fadeG) >> 12; *oDR = ((dR >> 3) * fadeG) >> 12;
     *oSL = (sL * fadeG) >> 15; *oSR = (sR * fadeG) >> 15;
 
     // voz limpia: el track tal cual, 1x, sin pitch, sin granos
@@ -742,6 +760,7 @@ static void render(s16 *dstL, s16 *dstR, int n) {
         shPh  += SHIM_INC;
         if ((++fCnt & 31) == 0) filterTarget();
         aCur += (aTgt - aCur) >> 6;
+        phWow += WOW_INC; phFl1 += FL1_INC; phFl2 += FL2_INC;
 
         s32 dL[2], dR[2], sL[2], sR[2], tr[2];
         xgS[0] += ((xfGainA << 8) - xgS[0]) >> 8;
@@ -751,7 +770,10 @@ static void render(s16 *dstL, s16 *dstR, int n) {
 
         // reverb estereo sobre las dos nubes
         s32 wl, wr;
-        reverbProcess(clamp16(sL[0] + sL[1]), clamp16(sR[0] + sR[1]), &wl, &wr);
+        if (revMix > 0) revIdle = 0; else if (revIdle < 100000) revIdle++;
+        if (revIdle == 99999) revClear();                          // sin reverb por ~3 s: se vacia y deja de gastar CPU
+        if (revIdle < 99999) reverbProcess(clamp16(sL[0] + sL[1]), clamp16(sR[0] + sR[1]), &wl, &wr);
+        else wl = wr = 0;
         s32 cmL = ((dL[0] + dL[1]) * (256 - (revMix >> 1)) + wl * revMix) >> 8;
         s32 cmR = ((dR[0] + dR[1]) * (256 - (revMix >> 1)) + wr * revMix) >> 8;
         s32 trk = tr[0] + tr[1];
@@ -760,18 +782,36 @@ static void render(s16 *dstL, s16 *dstR, int n) {
         s32 oL = cmL + tr_, oR = cmR + tr_;
         if (dtCur < dtTgt)      { dtCur += 96; if (dtCur > dtTgt) dtCur = dtTgt; }
         else if (dtCur > dtTgt) { dtCur -= 96; if (dtCur < dtTgt) dtCur = dtTgt; }
-        {
-            s32 dn = dtCur >> 8, df = dtCur & 255;
+        if (dMix > 0 || dLpL > 2 || dLpL < -2 || dLpR > 2 || dLpR < -2) {
+            s32 sw = lfoSin(phWow), sf = lfoSin(phFl1);
+            s32 dt = dtCur + ((sw * 2500 + sf * 600) >> 15);          // la cinta no gira pareja
+            s32 dn = dt >> 8, df = dt & 255;
             u32 r0 = (dW - (u32)dn) & DLY_MASK, r1 = (r0 - 1) & DLY_MASK;
             s32 eL = dlyL[r0] + (((dlyL[r1] - dlyL[r0]) * df) >> 8);
             s32 eR = dlyR[r0] + (((dlyR[r1] - dlyR[r0]) * df) >> 8);
-            dLpL += ((((eR * dFb) >> 8) - dLpL) * 180) >> 8;        // la repeticion se oscurece un poco
-            dLpR += ((((eL * dFb) >> 8) - dLpR) * 180) >> 8;
-            dlyL[dW] = (s16)clamp16(((oL + oR) >> 1) + dLpL);
+            // cada repeticion se oscurece y se satura un poco, como en la cinta
+            dLpL += ((softClip((eR * dFb) >> 8) - dLpL) * 100) >> 8;
+            dLpR += ((softClip((eL * dFb) >> 8) - dLpR) * 100) >> 8;
+            dlyL[dW] = (s16)clamp16(softClip((oL + oR) >> 1) + dLpL);
             dlyR[dW] = (s16)clamp16(dLpR);
             dW = (dW + 1) & DLY_MASK;
             oL += (eL * dMix) >> 8;
             oR += (eR * dMix) >> 8;
+        } else {                                                    // apagado: el buffer se vacia sin gastar CPU
+            dlyL[dW] = dlyR[dW] = 0; dLpL = dLpR = 0;
+            dW = (dW + 1) & DLY_MASK;
+        }
+
+        // flutter: vibrato leve y siempre presente en la linea corta (profundidad 0 = sin modulacion)
+        vbL[vbW] = (s16)clamp16(oL); vbR[vbW] = (s16)clamp16(oR);
+        {
+            s32 md = (lfoSin(phWow) * wowAmp + ((lfoSin(phFl1) + lfoSin(phFl2)) >> 1) * flAmp) >> 7;   // Q8 muestras
+            s32 d = 128 * 256 + md;
+            s32 dn = d >> 8, df = d & 255;
+            u32 r0 = (vbW - (u32)dn) & (VB_LEN - 1), r1 = (r0 - 1) & (VB_LEN - 1);
+            oL = vbL[r0] + (((vbL[r1] - vbL[r0]) * df) >> 8);
+            oR = vbR[r0] + (((vbR[r1] - vbR[r0]) * df) >> 8);
+            vbW = (vbW + 1) & (VB_LEN - 1);
         }
 
         // filtro pasa-bajos de toda la salida (con el filtro abierto solo sigue la senal, sin gastar)
@@ -782,7 +822,21 @@ static void render(s16 *dstL, s16 *dstR, int n) {
             oL = lp2(fS[0], oL);
             oR = lp2(fS[1], oR);
         }
-        dstL[i] = (s16)clamp16(softClip(oL));                   // limitador suave en la salida
+        // compresor de salida (fijo)
+        {
+            s32 pk = oL < 0 ? -oL : oL, pr = oR < 0 ? -oR : oR;
+            if (pr > pk) pk = pr;
+            if (pk > 262143) pk = 262143;
+            if (pk > cEnv) cEnv += (pk - cEnv) >> 6; else cEnv -= (cEnv >> 12) + 1;
+            if (cEnv < 0) cEnv = 0;
+            if ((i & 7) == 0)
+                cTgt = cEnv > COMP_T ? (s32)((((u32)(3 * COMP_T + cEnv)) << 13) / (u32)cEnv) : 32768;
+            cG += (cTgt - cG) >> 5;
+            oL = clampi(oL, -262143, 262143); oR = clampi(oR, -262143, 262143);
+            oL = (((oL >> 3) * cG) >> 12) * 358 >> 8;               // x1.4 de compensacion
+            oR = (((oR >> 3) * cG) >> 12) * 358 >> 8;
+        }
+        dstL[i] = (s16)clamp16(softClip(oL));                   // limitador suave al final
         dstR[i] = (s16)clamp16(softClip(oR));
     }
     dk = keep;
@@ -867,6 +921,9 @@ static void saveCache(const char *name, u32 wavSize, const s8 *buf, u32 len, u32
     fclose(f);
     if (!ok) remove(cn);
 }
+
+// mantener B durante una carga la cancela (asi la DS nunca parece colgada)
+static bool loadCancelled(void) { scanKeys(); return (keysHeld() & KEY_B) != 0; }
 
 // ---- canalizacion comun: mono s16 -> decimacion con promedio -> s8 normalizado
 typedef struct { s8 *buf; u32 j, outLen, phase, cnt, rate, storeRate; s32 acc; int pk; } Pipe;
@@ -976,6 +1033,7 @@ static const char *loadMp3(FILE *f, const char *name, u32 fileSize) {
     if (err) { MP3FreeDecoder(dec); free(ib); free(pcm); fclose(f); return err; }
 
     u32 done = 0, bad = 0, nb = 0, outSamps = 0;
+    bool cancelled = false;
     bool eof = (have < MP3_IN);
     while (done < frames && bad < 400) {
         if (have < 3000 && !eof) {                         // rellena el buffer de entrada
@@ -1012,12 +1070,16 @@ static const char *loadMp3(FILE *f, const char *name, u32 fileSize) {
         have -= used;
         if (have == 0 && eof) break;
         audioTick();
-        if ((++nb & 7) == 0) drawLoadBar((int)(done / (frames / 100 + 1)));
+        if ((++nb & 7) == 0) {
+            drawLoadBar((int)(done / (frames / 100 + 1)));
+            if (loadCancelled()) { cancelled = true; break; }
+        }
     }
     (void)outSamps;
     MP3FreeDecoder(dec);
     free(ib); free(pcm);
     fclose(f);
+    if (cancelled) { free(pp.buf); return "cancelado"; }
     return pipeFinish(&pp, name, fileSize);
 }
 
@@ -1105,6 +1167,7 @@ static const char *loadWav(const char *name) {
         done += n;
         audioTick();
         if ((++nb & 31) == 0) drawLoadBar((int)(done / (frames / 100 + 1)));
+        if ((nb & 7) == 0 && loadCancelled()) { free(blk); free(pp.buf); fclose(f); return "cancelado"; }
     }
     free(blk);
     fclose(f);
@@ -1187,21 +1250,18 @@ static void openBrowser(void) {
 }
 
 // ---------------------------------------------------------------- parametros / texto
-enum { P_XF, P_SPEED, P_PITCH, P_SIZE, P_DENS, P_SPRAY, P_DRIFT, P_HARM, P_SHIM, P_JIT, P_REV, P_PAN,
-       P_REVERB, P_DECAY, P_DLY, P_DTIME, P_DFB, P_FILT, P_SWEEP, P_VOL, P_LOAD, P_COUNT };
+enum { P_SPEED, P_PITCH, P_SIZE, P_DENS, P_SPRAY, P_DRIFT, P_HARM, P_SHIM, P_JIT, P_REV,
+       P_REVERB, P_DLY, P_FLUT, P_FILT, P_SWEEP, P_VOL, P_COUNT };
 static const char *const pLabel[P_COUNT] = {
-    "XFADE", "VELOCID", "PITCH", "TAMANO", "DENSID", "SPRAY", "DERIVA", "ARMONIA", "SHIMMER", "JITTER", "REVERSA", "ESTEREO",
-    "REVERB", "COLA", "DELAY", "TIEMPO", "REPITE", "FILTRO", "BARRIDO", "VOLUMEN", "CARGAR"
+    "VELOCID", "PITCH", "TAMANO", "DENSID", "SPRAY", "DERIVA", "ARMONIA", "SHIMMER", "JITTER", "REVERSA",
+    "REVERB", "TAPE DLY", "FLUTTER", "FILTRO", "BARRIDO", "VOLUMEN"
 };
-static int cur = 0, pTop = 0;
-#define P_ROWS 7
+static int cur = 0;
 
-static s32 stepDly(s32 v) { return v < 200 ? 10 : (v < 500 ? 25 : 50); }
 static s32 stepSize(s32 v) { return v < 100 ? 10 : (v < 500 ? 50 : 100); }
 
 static void adjust(int d) {
     switch (cur) {
-        case P_XF:    setXfade(xfade + d * 8);                        break;
         case P_SPEED: dk->speedPct = clampi(dk->speedPct + d * 5, -200, 200); updateInc(); break;
         case P_PITCH: dk->semis    = clampi(dk->semis + d, -24, 24);          updateInc(); break;
         case P_SIZE:  sizeMs   = clampi(sizeMs + d * stepSize(d > 0 ? sizeMs : sizeMs - 1), 10, 2000); updateInc(); break;
@@ -1210,26 +1270,21 @@ static void adjust(int d) {
         case P_DRIFT: driftPct = clampi(driftPct + d * 5, 0, 100);    if (!driftPct) dk->driftW = 0; break;
         case P_HARM:  harmPct  = clampi(harmPct + d * 5, 0, 100);     break;
         case P_SHIM:  shimPct  = clampi(shimPct + d * 5, 0, 100);     break;
-        case P_PAN:   panPct   = clampi(panPct + d * 5, 0, 100);      break;
         case P_DLY:   delayPct = clampi(delayPct + d * 5, 0, 100);    updateDelay(); break;
-        case P_DTIME: delayMs  = clampi(delayMs + d * stepDly(d > 0 ? delayMs : delayMs - 1), 50, 1000); updateDelay(); break;
-        case P_DFB:   delayFbPct = clampi(delayFbPct + d * 5, 0, 95); updateDelay(); break;
+        case P_FLUT:  flutPct  = clampi(flutPct + d * 5, 0, 100);     updateFlutter(); break;
         case P_FILT:  filtPct  = clampi(filtPct + d * 4, 0, 100);     break;
         case P_SWEEP: sweepPct = clampi(sweepPct + d * 5, 0, 100);    break;
         case P_JIT:   jitterC  = clampi(jitterC + d * 5, 0, 100);     break;
         case P_REV:   revPct   = clampi(revPct + d * 10, 0, 100);     break;
         case P_REVERB: revMixPct = clampi(revMixPct + d * 5, 0, 100); updateReverb(); break;
-        case P_DECAY: decayPct = clampi(decayPct + d * 5, 0, 100);    updateReverb(); break;
-        case P_VOL:   gain     = clampi(gain + d * 4, 4, 128);        updateInc(); break;
-        case P_LOAD:  if (d > 0) openBrowser();                       break;
+        case P_VOL:   gain     = clampi(gain + d * 8, 8, 240);        updateInc(); break;
         default: break;
     }
 }
 
 static void valStr(int i, char *b, size_t n) {
-    s32 tg = (gain * 2) / 5;
+    s32 tg = gain * 10 / 40;                              // 40 = 1.0x
     switch (i) {
-        case P_XF:    snprintf(b, n, "A %ld%% B", (long)(xfade * 100 / 256)); break;
         case P_SPEED: snprintf(b, n, "%c %+ld%%", 'A' + actDeck, (long)dk->speedPct); break;
         case P_PITCH: snprintf(b, n, "%c %+ld st", 'A' + actDeck, (long)dk->semis); break;
         case P_SIZE:  snprintf(b, n, "%ld ms", (long)sizeMs); break;
@@ -1238,10 +1293,8 @@ static void valStr(int i, char *b, size_t n) {
         case P_DRIFT: snprintf(b, n, "%ld%%", (long)driftPct); break;
         case P_HARM:  snprintf(b, n, "%ld%%", (long)harmPct); break;
         case P_SHIM:  snprintf(b, n, "%ld%%", (long)shimPct); break;
-        case P_PAN:   snprintf(b, n, "%ld%%", (long)panPct); break;
         case P_DLY:   snprintf(b, n, "%ld%%", (long)delayPct); break;
-        case P_DTIME: snprintf(b, n, "%ld ms", (long)delayMs); break;
-        case P_DFB:   snprintf(b, n, "%ld%%", (long)delayFbPct); break;
+        case P_FLUT:  snprintf(b, n, "%ld%%", (long)flutPct); break;
         case P_FILT:
             if (filtPct >= 100) snprintf(b, n, "abierto");
             else                snprintf(b, n, "%ld Hz", (long)fcHz[filtPct * 127 / 100]);
@@ -1253,9 +1306,7 @@ static void valStr(int i, char *b, size_t n) {
         case P_JIT:   snprintf(b, n, "%ld cent", (long)jitterC); break;
         case P_REV:   snprintf(b, n, "%ld%%", (long)revPct); break;
         case P_REVERB: snprintf(b, n, "%ld%%", (long)revMixPct); break;
-        case P_DECAY: snprintf(b, n, "%ld%%", (long)decayPct); break;
-        case P_VOL:   snprintf(b, n, "%ld.%ld x", (long)(tg / 16), (long)((tg % 16) * 10 / 16)); break;
-        case P_LOAD:  snprintf(b, n, "%s", sdOK ? (actDeck ? "audio -> B >" : "audio -> A >") : "sin SD"); break;
+        case P_VOL:   snprintf(b, n, "%ld.%ld x", (long)(tg / 10), (long)(tg % 10)); break;
         default:      b[0] = 0; break;
     }
 }
@@ -1268,7 +1319,6 @@ static void fmtT(char *b, size_t n, u32 tenths) {
 // 0..256 para la barra de cada parametro (-1 = sin barra)
 static s32 paramFrac(int i) {
     switch (i) {
-        case P_XF:     return xfade;
         case P_SPEED:  return (dk->speedPct + 200) * 256 / 400;
         case P_PITCH:  return (dk->semis + 24) * 256 / 48;
         case P_SIZE:   return isqrt32((u32)sizeMs * 65536u / 2000u);
@@ -1277,25 +1327,19 @@ static s32 paramFrac(int i) {
         case P_DRIFT:  return driftPct * 256 / 100;
         case P_HARM:   return harmPct * 256 / 100;
         case P_SHIM:   return shimPct * 256 / 100;
-        case P_PAN:    return panPct * 256 / 100;
         case P_DLY:    return delayPct * 256 / 100;
-        case P_DTIME:  return (delayMs - 50) * 256 / 950;
-        case P_DFB:    return delayFbPct * 256 / 95;
+        case P_FLUT:   return flutPct * 256 / 100;
         case P_FILT:   return filtPct * 256 / 100;
         case P_SWEEP:  return sweepPct * 256 / 100;
         case P_JIT:    return jitterC * 256 / 100;
         case P_REV:    return revPct * 256 / 100;
         case P_REVERB: return revMixPct * 256 / 100;
-        case P_DECAY:  return decayPct * 256 / 100;
-        case P_VOL:    return gain * 256 / 128;
+        case P_VOL:    return gain * 256 / 240;
         default:       return -1;
     }
 }
 
-#define PR_Y0  78
-#define PR_H   11
-
-static char sigCache[16][128];
+static char sigCache[20][128];
 static bool topFull = true;
 
 // true si lo que va en ese bloque cambio desde la ultima vez (asi solo se redibuja lo necesario)
@@ -1306,33 +1350,7 @@ static bool sigChanged(int slot, const char *sig) {
     return true;
 }
 
-static void drawParamRow(int r, int i, const char *v, int up, int dn) {
-    int y = PR_Y0 + r * PR_H;
-    bool sl = (i == cur);
-    rect(fbTop, 0, y, VW, PR_H, sl ? C_YEL : C_BG);
-    text(fbTop, 8, y + 1, pLabel[i], sl ? C_DARK : C_LGRAY, 1);
-    s32 f = paramFrac(i);
-    if (f >= 0) {
-        int bx = 66, bw = 84;
-        u16 fc = sl ? C_ORG : C_GRAY;
-        int fw = (int)f * bw / 256;
-        rect(fbTop, bx, y + 3, bw, 5, sl ? C_YELD : C_PANEL2);
-        if (i == P_SPEED || i == P_PITCH || i == P_XF) {     // barras bipolares: parten del centro
-            int cx = bx + bw / 2;
-            if (fw >= bw / 2) rect(fbTop, cx, y + 3, fw - bw / 2, 5, fc);
-            else              rect(fbTop, bx + fw, y + 3, bw / 2 - fw, 5, fc);
-            rect(fbTop, cx, y + 2, 1, 7, sl ? C_DARK : C_LGRAY);
-        } else {
-            rect(fbTop, bx, y + 3, fw, 5, fc);
-        }
-    }
-    text(fbTop, 240 - textW(v, 1), y + 1, v, sl ? C_DARK : C_WHITE, 1);
-    if (up) text(fbTop, 246, y + 1, "^", C_ORG, 1);
-    if (dn) text(fbTop, 246, y + 1, "v", C_ORG, 1);
-}
-
 // ---- dibujo de cinta: lineas, discos, carretes
-static s32 sinT[64];                                   // Q8
 static void putpx(u16 *s, int x, int y, u16 c) { if ((unsigned)x < VW && (unsigned)y < VH) s[y * VW + x] = c; }
 
 static void line(u16 *s, int x0, int y0, int x1, int y1, u16 c) {
@@ -1362,90 +1380,163 @@ static void ringO(u16 *s, int cx, int cy, int r, u16 c) {
     }
 }
 
-// un carrete: paquete de cinta (radio rp), pestanas, nucleo y 3 radios que giran
+// un carrete: paquete de cinta (radio rp), pestana, nucleo y 3 radios que giran
 static void drawReel(int cx, int cy, int rp, int ang64, u16 hub) {
     disc(fbTop, cx, cy, rp, C_YELD);
-    ringO(fbTop, cx, cy, 15, C_LGRAY);
+    ringO(fbTop, cx, cy, 10, C_LGRAY);
     ringO(fbTop, cx, cy, rp, C_ORGD);
     for (int k = 0; k < 3; k++) {
         int a = (ang64 + k * 21 + (k + 1) / 2) & 63;               // 0, 21, 43 ~ tercios de 64
         int ca = sinT[(a + 16) & 63], sa = sinT[a];
-        line(fbTop, cx + (ca * 4 >> 8), cy + (sa * 4 >> 8), cx + (ca * 14 >> 8), cy + (sa * 14 >> 8), C_DARK);
-        line(fbTop, cx + (ca * 4 >> 8) + 1, cy + (sa * 4 >> 8), cx + (ca * 14 >> 8) + 1, cy + (sa * 14 >> 8), C_LGRAY);
+        line(fbTop, cx + (ca * 3 >> 8), cy + (sa * 3 >> 8), cx + (ca * 8 >> 8), cy + (sa * 8 >> 8), C_DARK);
     }
-    disc(fbTop, cx, cy, 4, hub);
-    disc(fbTop, cx, cy, 1, C_DARK);
+    disc(fbTop, cx, cy, 3, hub);
+    putpx(fbTop, cx, cy, C_DARK);
 }
 
-#define RZ_Y   27          // zona de carretes (se redibuja cada cuadro)
-#define RZ_H   33
-
 static s32 heardPosD(Deck *d, u32 ahead);
+
+// ---------------------------------------------------------------- vista de knobs
+// Se dibuja siempre en el motor principal (fbTop). Con "PANTALLAS" las dos pantallas se
+// intercambian fisicamente y esta vista queda abajo, donde se toca.
+#define PNL_Y   15                  // paneles de deck
+#define PNL_H   38
+#define KY0     58                  // rejilla de knobs: 4 columnas x 2 filas
+#define KCH     50
+#define TAB_Y   160
+
+#define NPAGES 2
+static const s8 pageKn[NPAGES][8] = {
+    { P_SPEED, P_PITCH, P_VOL, P_FLUT, P_REVERB, P_DLY, P_FILT, P_SWEEP },     // mezcla + espacio juntos
+    { P_SIZE, P_DENS, P_SPRAY, P_DRIFT, P_HARM, P_SHIM, P_JIT, P_REV }
+};
+static const char *const pageName[NPAGES] = { "MEZCLA", "NUBE" };
+static int kPage = 0, kSel = 0;
+static bool swapped = false;        // false: knobs arriba, ondas abajo (tactil). true: al reves.
+
+static int knobAt(int page, int k) { return (k >= 0 && k < 8) ? pageKn[page][k] : -1; }
+static void selectKnob(int k) { if (knobAt(kPage, k) >= 0) { kSel = k; cur = pageKn[kPage][k]; } }
+static void setPage(int p) {
+    kPage = (p + NPAGES) % NPAGES;
+    if (knobAt(kPage, kSel) < 0) kSel = 0;
+    cur = pageKn[kPage][kSel];
+}
+static void moveKnob(int dir) {
+    for (int n = 0; n < 8; n++) {
+        kSel = (kSel + dir + 8) & 7;
+        if (knobAt(kPage, kSel) >= 0) break;
+    }
+    cur = pageKn[kPage][kSel];
+}
+
+#ifndef LCD_SWAP_REG
+#define LCD_SWAP_REG (*(volatile u16 *)0x04000304)       // REG_POWERCNT: el bit 15 intercambia las pantallas
+#endif
+static void doSwap(void) { swapped = !swapped; LCD_SWAP_REG ^= (u16)(1 << 15); }
 
 static void drawDeckPanel(int di, s32 heard, bool statics) {
     Deck *d = &decks[di];
     int px = di ? 129 : 1;
     bool act = (di == actDeck);
+    char sig[64];
     if (statics) {
-        rect(fbTop, px, 15, 126, 60, C_PANEL);
-        rect(fbTop, px, 15, 126, 1, act ? C_ORG : C_LINE);
-        rect(fbTop, px, 74, 126, 1, act ? C_ORG : C_LINE);
-        rect(fbTop, px, 15, 1, 60, act ? C_ORG : C_LINE);
-        rect(fbTop, px + 125, 15, 1, 60, act ? C_ORG : C_LINE);
-        pill(fbTop, px + 4, 18, 13, 9, act ? C_ORG : C_PANEL2);
-        text(fbTop, px + 7, 18, di ? "B" : "A", act ? C_DARK : C_LGRAY, 1);
+        rect(fbTop, px, PNL_Y, 126, PNL_H, C_PANEL);
+        u16 bc = act ? C_ORG : C_LINE;
+        rect(fbTop, px, PNL_Y, 126, 1, bc); rect(fbTop, px, PNL_Y + PNL_H - 1, 126, 1, bc);
+        rect(fbTop, px, PNL_Y, 1, PNL_H, bc); rect(fbTop, px + 125, PNL_Y, 1, PNL_H, bc);
+        pill(fbTop, px + 4, PNL_Y + 3, 13, 9, act ? C_ORG : C_PANEL2);
+        text(fbTop, px + 7, PNL_Y + 3, di ? "B" : "A", act ? C_DARK : C_LGRAY, 1);
         char nm[24];
-        snprintf(nm, sizeof nm, "%.17s", d->curName);
-        text(fbTop, px + 20, 18, nm, act ? C_WHITE : C_LGRAY, 1);
+        snprintf(nm, sizeof nm, "%.11s", d->curName);
+        text(fbTop, px + 20, PNL_Y + 3, nm, act ? C_WHITE : C_LGRAY, 1);
+        sigCache[1 + di][0] = 0; sigCache[3 + di][0] = 0;       // fuerza el redibujo de lo de adentro
     }
-    // carretes y camino de la cinta
-    rect(fbTop, px + 2, RZ_Y, 122, RZ_H, C_PANEL);
+    // carretes: el paquete de cinta pasa de un carrete al otro segun la posicion
     u32 len = d->srcLen ? d->srcLen : 1;
-    s32 pos = d->dropOn ? d->trackI : d->posI;
-    s32 fr = (s32)((u32)pos * 256 / len);                       // 0..255
-    int rl = 6 + (255 - fr) * 8 / 255, rr = 6 + fr * 8 / 255;
-    int cxl = px + 30, cxr = px + 96, cy = RZ_Y + 16;
+    s32 fr = (s32)((u32)(d->posI < 0 ? 0 : d->posI) * 255 / len);
+    int rl = 4 + (255 - fr) * 5 / 255, rr = 4 + fr * 5 / 255;
+    if (d->playing) d->reel += 3 << 10;
     int ang = (int)((u32)d->reel >> 10) & 63;
-    line(fbTop, cxl, cy + rl, px + 46, RZ_Y + 29, C_YELD);
-    line(fbTop, px + 46, RZ_Y + 29, px + 80, RZ_Y + 29, C_YELD);
-    line(fbTop, px + 80, RZ_Y + 29, cxr, cy + rr, C_YELD);
-    drawReel(cxl, cy, rl, ang, C_GRAY);
-    drawReel(cxr, cy, rr, (ang + 9) & 63, C_GRAY);
-    rect(fbTop, px + 54, RZ_Y + 29, 18, 4, d->playing ? C_ORG : C_GRAY);     // cabezal
-    rect(fbTop, px + 46 - 1, RZ_Y + 27, 3, 4, C_LGRAY);                       // guias
-    rect(fbTop, px + 80 - 1, RZ_Y + 27, 3, 4, C_LGRAY);
+    snprintf(sig, sizeof sig, "%d|%d|%d|%d", ang, rl, rr, (int)d->playing);
+    if (sigChanged(1 + di, sig)) {
+        int cxl = px + 17, cxr = px + 47, cy = PNL_Y + 24;
+        rect(fbTop, px + 2, PNL_Y + 14, 60, 23, C_PANEL);
+        line(fbTop, cxl, cy + rl, cxr, cy + rr, C_YELD);                       // cinta entre carretes
+        drawReel(cxl, cy, rl, ang, C_GRAY);
+        drawReel(cxr, cy, rr, (ang + 9) & 63, C_GRAY);
+        rect(fbTop, px + 27, cy + 7, 10, 3, d->playing ? C_ORG : C_GRAY);       // cabezal
+    }
 
     // contador + estado
-    char sig[64], a[20], b[20];
+    char a[20], b[20];
     u32 now10 = (u32)heard * 10 / d->srcRate, len10 = d->srcLen * 10 / d->srcRate;
     fmtT(a, sizeof a, now10); fmtT(b, sizeof b, len10);
     int stt = (act && loopEdit) ? 1 : 0;
-    snprintf(sig, sizeof sig, "%s|%s|%d|%d|%d|%d", a, b, d->loopStart * 100 / (s32)d->srcLen + d->loopEnd * 1000 / (s32)d->srcLen, stt, d->playing, act);
-    if (sigChanged(1 + di, sig)) {
-        rect(fbTop, px + 1, 62, 124, 11, C_PANEL);
-        text(fbTop, px + 4, 63, a, C_YEL, 1);
+    int isLoop = (d->loopStart > 0 || d->loopEnd < (s32)d->srcLen - 1);
+    snprintf(sig, sizeof sig, "%s|%s|%d|%d|%d", a, b, stt, (int)d->playing, isLoop);
+    if (sigChanged(3 + di, sig)) {
+        rect(fbTop, px + 64, PNL_Y + 14, 60, 23, C_PANEL);
+        text(fbTop, px + 66, PNL_Y + 16, a, C_YEL, 1);
         char t2[24];
         snprintf(t2, sizeof t2, "/%s", b);
-        text(fbTop, px + 4 + textW(a, 1), 63, t2, C_GRAY, 1);
+        text(fbTop, px + 66, PNL_Y + 26, t2, C_GRAY, 1);
+        rect(fbTop, px + 73, PNL_Y + 2, 51, 11, C_PANEL);
         int x = px + 121;
-        if (stt)         { x -= textW("EDIT", 1); text(fbTop, x, 63, "EDIT", C_WHITE, 1); x -= 5; }
-        if (!stt && (d->loopStart > 0 || d->loopEnd < (s32)d->srcLen - 1)) { x -= textW("LOOP", 1); text(fbTop, x, 63, "LOOP", C_YEL, 1); x -= 5; }
-        if (!d->playing) { x -= textW("||", 1);   text(fbTop, x, 63, "||", C_ORG, 1); }
+        if (!d->playing) { x -= textW("||", 1); text(fbTop, x, PNL_Y + 3, "||", C_ORG, 1); x -= 5; }
+        if (stt)         { x -= textW("EDIT", 1); text(fbTop, x, PNL_Y + 3, "EDIT", C_WHITE, 1); }
+        else if (isLoop) { x -= textW("LOOP", 1); text(fbTop, x, PNL_Y + 3, "LOOP", C_YEL, 1); }
     }
 }
 
-static void drawMain(u32 lead) {
-    if (topFull) clearScreen(fbTop, C_BG);
-    char sig[128], v[24];
+static void drawKnob(int k, int pid, bool sel) {
+    int col = k & 3, row = k >> 2;
+    int x0 = col * 64 + 1, y0 = KY0 + row * KCH, cx = col * 64 + 32, cy = y0 + 25;
+    rect(fbTop, x0, y0, 62, KCH - 2, sel ? C_PANEL : C_BG);
+    if (pid < 0) return;
+    const char *lb = pLabel[pid];
+    text(fbTop, cx - textW(lb, 1) / 2, y0 + 1, lb, sel ? C_YEL : C_GRAY, 1);
+    s32 f = paramFrac(pid);
+    if (f < 0) f = 0;
+    if (f > 256) f = 256;
+    int lit = (int)((f * 10 + 128) / 256);                      // cuantos puntos del aro estan encendidos
+    for (int t = 0; t <= 10; t++) {
+        int a = 24 + t * 48 / 10;
+        int tx = cx + ((sinT[(a + 16) & 63] * 15) >> 8), ty = cy + ((sinT[a & 63] * 15) >> 8);
+        rect(fbTop, tx - 1, ty - 1, 2, 2, t <= lit && f > 0 ? C_ORG : C_PANEL2);
+    }
+    disc(fbTop, cx, cy, 10, sel ? C_LINE : C_PANEL2);
+    int a = 24 + (int)(f * 48 / 256);
+    int ca = sinT[(a + 16) & 63], sa = sinT[a & 63];
+    line(fbTop, cx + (ca * 3 >> 8), cy + (sa * 3 >> 8), cx + (ca * 9 >> 8), cy + (sa * 9 >> 8), C_WHITE);
+    char v[24];
+    valStr(pid, v, sizeof v);
+    text(fbTop, cx - textW(v, 1) / 2, y0 + 37, v, sel ? C_WHITE : C_LGRAY, 1);
+}
 
-    snprintf(sig, sizeof sig, "%d|%d|%d|%d", actDeck, (int)sdOK, (int)xfade, (int)grainCap);
+static void drawTabs(void) {
+    rect(fbTop, 0, TAB_Y - 2, VW, VH - TAB_Y + 2, C_BG);
+    for (int p = 0; p < NPAGES; p++) {
+        int x = 4 + p * 88;
+        bool on = (p == kPage);
+        pill(fbTop, x, TAB_Y + 2, 84, 24, on ? C_ORG : C_PANEL2);
+        text(fbTop, x + 42 - textW(pageName[p], 1) / 2, TAB_Y + 9, pageName[p], on ? C_DARK : C_LGRAY, 1);
+    }
+    pill(fbTop, 182, TAB_Y + 2, 70, 24, C_PANEL2);
+    text(fbTop, 217 - textW("PANTALLAS", 1) / 2, TAB_Y + 9, "PANTALLAS", C_LGRAY, 1);
+}
+
+static void drawKView(u32 lead) {
+    if (topFull) clearScreen(fbTop, C_BG);
+    char sig[128];
+
+    snprintf(sig, sizeof sig, "%d|%d|%d", (int)sdOK, (int)xfade, (int)grainCap);
     if (sigChanged(0, sig)) {
         rect(fbTop, 0, 0, VW, 14, C_PANEL);
         rect(fbTop, 0, 0, 4, 14, C_ORG);
         text(fbTop, 10, 2, "EFEES", C_WHITE, 1);
         text(fbTop, 46, 2, "reel to reel", C_ORG, 1);
-        if (!sdOK) text(fbTop, 112, 2, "sin SD", C_GRAY, 1);
-        else if (grainCap < MAX_GRAINS) { char gs[12]; snprintf(gs, sizeof gs, "g%d", (int)grainCap); text(fbTop, 118, 2, gs, C_GRAY, 1); }
+        if (!sdOK) text(fbTop, 126, 2, "sin SD", C_GRAY, 1);
+        else if (grainCap < 8) { char gs[12]; snprintf(gs, sizeof gs, "g%d", (int)grainCap); text(fbTop, 130, 2, gs, C_GRAY, 1); }
         char x[16];
         snprintf(x, sizeof x, "A %ld%% B", (long)(xfade * 100 / 256));
         text(fbTop, VW - 6 - textW(x, 1), 2, x, C_YEL, 1);
@@ -1454,48 +1545,29 @@ static void drawMain(u32 lead) {
     for (int di = 0; di < 2; di++) {
         bool st = topFull;
         snprintf(sig, sizeof sig, "%d|%d|%.100s", di == actDeck, di, decks[di].curName);
-        if (sigChanged(11 + di, sig)) st = true;
+        if (sigChanged(16 + di, sig)) st = true;
         drawDeckPanel(di, heardPosD(&decks[di], lead), st);
         audioTick();
     }
-    // nivel de cada deck segun el crossfader
-    {
-        snprintf(sig, sizeof sig, "%d", (int)xfade);
-        if (sigChanged(13, sig)) {
-            rect(fbTop, 1, 75, 126, 2, C_BG);  rect(fbTop, 129, 75, 126, 2, C_BG);
-            rect(fbTop, 1, 75, 126 * xfGainA / 256, 2, C_ORG);
-            rect(fbTop, 129, 75, 126 * xfGainB / 256, 2, C_ORG);
-        }
+
+    snprintf(sig, sizeof sig, "%d", (int)xfade);               // nivel de cada deck segun el crossfader
+    if (sigChanged(13, sig)) {
+        rect(fbTop, 1, 54, 126, 2, C_BG);  rect(fbTop, 129, 54, 126, 2, C_BG);
+        rect(fbTop, 1, 54, 126 * xfGainA / 256, 2, C_ORG);
+        rect(fbTop, 129, 54, 126 * xfGainB / 256, 2, C_ORG);
     }
 
-    // parametros (con scroll)
-    if (cur < pTop) pTop = cur;
-    if (cur >= pTop + P_ROWS) pTop = cur - P_ROWS + 1;
-    for (int r = 0; r < P_ROWS; r++) {
-        int i = pTop + r;
-        char sg[96];
-        if (i >= P_COUNT) {
-            if (sigChanged(4 + r, "-")) rect(fbTop, 0, PR_Y0 + r * PR_H, VW, PR_H, C_BG);
-            continue;
-        }
-        valStr(i, v, sizeof v);
-        int up = (r == 0 && pTop > 0), dn = (r == P_ROWS - 1 && pTop + P_ROWS < P_COUNT);
-        snprintf(sg, sizeof sg, "%d|%d|%s|%d|%d|%d", i, (int)(i == cur), v, (int)paramFrac(i), up, dn);
-        if (sigChanged(4 + r, sg)) drawParamRow(r, i, v, up, dn);
+    for (int k = 0; k < 8; k++) {
+        int pid = knobAt(kPage, k);
+        char v[24];
+        if (pid >= 0) valStr(pid, v, sizeof v); else v[0] = 0;
+        snprintf(sig, sizeof sig, "%d|%d|%d|%s|%c", pid, (int)(pid >= 0 && k == kSel), pid >= 0 ? (int)paramFrac(pid) : 0, v, 'A' + actDeck);
+        if (sigChanged(5 + k, sig)) drawKnob(k, pid, pid >= 0 && k == kSel);
     }
+    audioTick();
 
-    // ayuda (fija)
-    if (topFull) {
-        rect(fbTop, 8, 158, 240, 1, C_PANEL2);
-        int x = 8;
-        keyHint(&x, 162, "START", "play");
-        keyHint(&x, 162, "B", "freeze");
-        x = 8;
-        keyHint(&x, 173, "SELECT", "A/B");
-        keyHint(&x, 173, "L/R", "crossfade");
-        x = 8;
-        keyHint(&x, 184, "Y", "loop=todo");
-    }
+    snprintf(sig, sizeof sig, "%d", kPage);
+    if (sigChanged(14, sig)) drawTabs();
     topFull = false;
 }
 
@@ -1629,12 +1701,12 @@ static void fillTri(int x, int y, int dir, u16 c) {
 
 #define BTN_Y  159
 #define BTN_H  30
-#define BTN_W  46
+#define BTN_W  38
 
 static void btnFrame(int x, u16 bg) { pill(fb, x, BTN_Y, BTN_W, BTN_H, bg); }
 static void btnLabel(int x, const char *t, u16 c) { text(fb, x + (BTN_W - textW(t, 1)) / 2, 177, t, c, 1); }
 
-// 5 botones de 46 px, paso 50: x = 4, 54, 104, 154, 204. Cortes del toque en main: 52, 102, 152, 202.
+// 6 botones de 38 px, paso 42: x = 4, 46, 88, 130, 172, 214. Cortes del toque en main: 44, 86, 128, 170, 212.
 // Todos actuan sobre el deck activo.
 static void drawButtons(void) {
     rect(fb, 0, BAR_Y, VW, VH - BAR_Y, C_PANEL);
@@ -1642,7 +1714,7 @@ static void drawButtons(void) {
     u16 fg;
 
     // [play / pausa]
-    x = 4; cx = x + 23;
+    x = 4; cx = x + 19;
     fg = dk->playing ? C_DARK : C_LGRAY;
     btnFrame(x, dk->playing ? C_ORG : C_PANEL2);
     if (dk->playing) { rect(fb, cx - 8, iy, 5, 14, fg); rect(fb, cx + 3, iy, 5, 14, fg); }
@@ -1650,24 +1722,24 @@ static void drawButtons(void) {
     btnLabel(x, dk->playing ? "PAUSA" : "PLAY", fg);
 
     // [loop]: corchetes
-    x = 54; cx = x + 23;
+    x = 46; cx = x + 19;
     fg = loopEdit ? C_DARK : C_LGRAY;
     btnFrame(x, loopEdit ? C_YEL : C_PANEL2);
-    rect(fb, cx - 14, iy, 3, 14, fg); rect(fb, cx - 14, iy, 6, 3, fg); rect(fb, cx - 14, iy + 11, 6, 3, fg);
-    rect(fb, cx + 11, iy, 3, 14, fg); rect(fb, cx + 8, iy, 6, 3, fg);  rect(fb, cx + 8, iy + 11, 6, 3, fg);
+    rect(fb, cx - 13, iy, 3, 14, fg); rect(fb, cx - 13, iy, 6, 3, fg); rect(fb, cx - 13, iy + 11, 6, 3, fg);
+    rect(fb, cx + 10, iy, 3, 14, fg); rect(fb, cx + 7, iy, 6, 3, fg);  rect(fb, cx + 7, iy + 11, 6, 3, fg);
     rect(fb, cx - 3, iy + 5, 6, 4, fg);
     btnLabel(x, loopEdit ? "EDITAR" : "LOOP", fg);
 
     // [al inicio]: barra + triangulo a la izquierda
-    x = 104; cx = x + 23;
+    x = 88; cx = x + 19;
     fg = C_LGRAY;
     btnFrame(x, C_PANEL2);
     rect(fb, cx - 12, iy, 3, 14, fg);
     fillTri(cx + 8, iy, -1, fg);
     btnLabel(x, "INICIO", fg);
 
-    // [carpeta]: carga un WAV en el deck activo
-    x = 154; cx = x + 23;
+    // [carpeta]: carga un audio en el deck activo
+    x = 130; cx = x + 19;
     fg = C_LGRAY;
     btnFrame(x, C_PANEL2);
     rect(fb, cx - 12, iy + 1, 9, 3, fg);
@@ -1675,12 +1747,20 @@ static void drawButtons(void) {
     btnLabel(x, actDeck ? "SD > B" : "SD > A", fg);
 
     // [TODO]: loop = track completo (marco)
-    x = 204; cx = x + 23;
+    x = 172; cx = x + 19;
     fg = C_LGRAY;
     btnFrame(x, C_PANEL2);
     rect(fb, cx - 12, iy, 24, 14, fg);
     rect(fb, cx - 9, iy + 3, 18, 8, C_PANEL2);
     btnLabel(x, "TODO", fg);
+
+    // [PANT.]: intercambia las dos pantallas (dos marcos apilados)
+    x = 214; cx = x + 19;
+    fg = C_LGRAY;
+    btnFrame(x, C_PANEL2);
+    rect(fb, cx - 9, iy, 18, 6, fg); rect(fb, cx - 7, iy + 2, 14, 2, C_PANEL2);
+    rect(fb, cx - 9, iy + 8, 18, 6, fg);
+    btnLabel(x, "PANT.", fg);
 
     lastPlaying = dk->playing;
     lastLoopOn = loopEdit;
@@ -1808,6 +1888,7 @@ int main(void) {
     updateDelay();
     dtCur = dtTgt;
     updateReverb();
+    updateFlutter();
     for (int i = 0; i < 2; i++) {                    // los dos decks arrancan con el demo; A suena, B espera
         dk = &decks[i];
         dk->speedPct = 100; dk->semis = 0;
@@ -1817,6 +1898,8 @@ int main(void) {
     }
     dk = &decks[0];
     setXfade(0);
+    setPage(0);
+    selectKnob(0);
 
     DC_FlushRange(outL, sizeof(outL));
     DC_FlushRange(outR, sizeof(outR));
@@ -1833,7 +1916,6 @@ int main(void) {
     leadT = LEAD * 16;
     ringWr = LEAD;
     bool uiDirty = true;
-    int touchDeck = 0;
     keysSetRepeat(15, 3);
 
     while (1) {
@@ -1881,47 +1963,64 @@ int main(void) {
         } else {
             freezeKey = (kh & KEY_B) != 0;
             if (kd & KEY_START)  togglePlay();
+            if (kd & KEY_A)      doSwap();
             if (kd & KEY_SELECT) { actDeck ^= 1; dk = &decks[actDeck]; fullRedraw = true; topFull = true; }
-            if (kd & KEY_Y)      { dk->loopStart = 0; dk->loopEnd = (s32)dk->srcLen - 1; }
+            if (kd & KEY_X)      setPage(kPage - 1);
+            if (kd & KEY_Y)      setPage(kPage + 1);
             if (kr & KEY_L)      setXfade(xfade - 8);
             if (kr & KEY_R)      setXfade(xfade + 8);
-            if (kr & KEY_UP)     cur = (cur + P_COUNT - 1) % P_COUNT;
-            if (kr & KEY_DOWN)   cur = (cur + 1) % P_COUNT;
-            if (kr & KEY_LEFT)   adjust(-1);
-            if (kr & KEY_RIGHT)  adjust(+1);
+            if (kr & KEY_LEFT)   moveKnob(-1);
+            if (kr & KEY_RIGHT)  moveKnob(+1);
+            if (kr & KEY_UP)     adjust(+1);
+            if (kr & KEY_DOWN)   adjust(-1);
 
-            // pantalla tactil: botones abajo, crossfader en el medio, scrub vertical en las columnas
+            // pantalla tactil: lo que este abajo (ondas o knobs) responde al stylus
             if (kh & KEY_TOUCH) {
                 touchPosition t;
                 touchRead(&t);
                 if (kd & KEY_TOUCH) {
-                    touchDrag = false;
-                    if (t.py >= BAR_Y) {
-                        if (t.px < 52)       togglePlay();
-                        else if (t.px < 102) toggleLoop();
-                        else if (t.px < 152) seekTo(dk->loopStart);
-                        else if (t.px < 202) openBrowser();
-                        else               { dk->loopStart = 0; dk->loopEnd = (s32)dk->srcLen - 1; }
+                    touchDrag = false; xfDrag = false; kDrag = -1;
+                    if (swapped) {                                   // knobs abajo
+                        if (t.py >= TAB_Y) {
+                            if (t.px < 90) setPage(0); else if (t.px < 180) setPage(1); else doSwap();
+                        } else if (t.py >= KY0 && t.py < KY0 + 2 * KCH) {
+                            int k = ((t.py - KY0) / KCH) * 4 + t.px / 64;
+                            if (knobAt(kPage, k) >= 0) { selectKnob(k); kDrag = k; kY0 = t.py; kDone = 0; }
+                        } else if (t.py >= PNL_Y && t.py < PNL_Y + PNL_H) {
+                            int dd = t.px < 128 ? 0 : 1;
+                            if (dd != actDeck) { actDeck = dd; dk = &decks[dd]; fullRedraw = true; topFull = true; }
+                        }
+                    } else if (t.py >= BAR_Y) {                      // botones de las ondas
+                        if (t.px < 44)       togglePlay();
+                        else if (t.px < 86)  toggleLoop();
+                        else if (t.px < 128) seekTo(dk->loopStart);
+                        else if (t.px < 170) openBrowser();
+                        else if (t.px < 212) { dk->loopStart = 0; dk->loopEnd = (s32)dk->srcLen - 1; }
+                        else                 doSwap();
                     } else if (t.py >= XF_Y - 2) {
                         xfDrag = true;
-                    } else if (t.py >= TOPY) {
-                        touchDeck = t.px < 128 ? 0 : 1;
-                        if (touchDeck != actDeck) { actDeck = touchDeck; dk = &decks[actDeck]; fullRedraw = true; topFull = true; }
-                        touchDrag = true;
-                        if (loopEdit) {
-                            loopAnchor = clampi(t.py - TOPY, 0, PH - 1);
-                            loopAnchor = (s32)((u32)loopAnchor * (dk->srcLen - 1) / (PH - 1));
+                    } else {                                          // columnas de ondas (o etiquetas A / B)
+                        int dd = t.px < 128 ? 0 : 1;
+                        if (dd != actDeck) { actDeck = dd; dk = &decks[dd]; fullRedraw = true; topFull = true; }
+                        if (t.py >= TOPY) {
+                            touchDrag = true;
+                            if (loopEdit) {
+                                loopAnchor = clampi(t.py - TOPY, 0, PH - 1);
+                                loopAnchor = (s32)((u32)loopAnchor * (dk->srcLen - 1) / (PH - 1));
+                            }
                         }
-                    } else {                                      // etiquetas A / B: elegir deck
-                        touchDeck = t.px < 128 ? 0 : 1;
-                        if (touchDeck != actDeck) { actDeck = touchDeck; dk = &decks[actDeck]; fullRedraw = true; topFull = true; }
                     }
                 }
                 if (xfDrag) setXfade((t.px - 20) * 256 / 216);
+                if (kDrag >= 0) {                                    // arrastre vertical sobre un knob: 2 px por paso
+                    int want = (kY0 - t.py) / 2;
+                    while (kDone < want) { adjust(+1); kDone++; }
+                    while (kDone > want) { adjust(-1); kDone--; }
+                }
                 if (touchDrag) {
                     s32 r = clampi(t.py - TOPY, 0, PH - 1);
                     s32 idx = (s32)((u32)r * (dk->srcLen - 1) / (PH - 1));
-                    if (loopEdit) {                               // el stylus arrastra y delimita el loop
+                    if (loopEdit) {                                   // el stylus arrastra y delimita el loop
                         dk->loopStart = idx < loopAnchor ? idx : loopAnchor;
                         dk->loopEnd   = idx < loopAnchor ? loopAnchor : idx;
                         fixLoop(true);
@@ -1929,7 +2028,7 @@ int main(void) {
                 }
             } else {
                 if (touchDrag && loopEdit && (dk->posI < dk->loopStart || dk->posI >= dk->loopEnd)) seekTo(dk->loopStart);
-                touchDrag = false; xfDrag = false;
+                touchDrag = false; xfDrag = false; kDrag = -1;
             }
             touching = touchDrag;
         }
@@ -1940,8 +2039,7 @@ int main(void) {
         updateView(lead);
         audioTick();
         if (!browsing) {
-            for (int di = 0; di < 2; di++) decks[di].reel += decks[di].playing ? 54000 : 0;   // carretes girando
-            if (uiDirty || (++frame % 6) == 0) { drawMain(lead); uiDirty = false; }
+            if (uiDirty || (++frame % 6) == 0) { drawKView(lead); uiDirty = false; }
         }
 
         // audio: renderiza por delante del playhead
